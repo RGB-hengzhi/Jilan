@@ -1,0 +1,25 @@
+# macOS metadata
+.DS_Store
+._*
+
+# Local builds and release artifacts
+/交付/
+/build/
+/dist/
+*.dmg
+*.app/
+
+# Local verification reports may contain real paths
+/验证记录/
+*.log
+
+# Runtime data and developer-specific state
+*.qfi
+roots.json
+search-workspace-v2.json
+workspace-session.json
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
