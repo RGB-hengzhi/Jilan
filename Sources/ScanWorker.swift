@@ -36,21 +36,29 @@ enum ScanWorker {
 
     static func scan(path: String, excludedPrefixes: [String], cancelled: () -> Bool,
                      onEntry: (String, Bool) -> Void, onProgress: (Int, String) -> Void,
-                     onIOIntent: ((String) -> Void)? = nil) -> ScanReport {
+                     onIOIntent: ((String) -> Void)? = nil,
+                     indexEntry: ((String, Bool) -> (changed: Bool, count: Int))? = nil) -> ScanReport {
         scan(path: path, excludedPrefixes: excludedPrefixes, cancelled: cancelled,
-             onEntry: onEntry, onProgress: onProgress, onIOIntent: onIOIntent, options: Options())
+             onEntry: onEntry, onProgress: onProgress, onIOIntent: onIOIntent, indexEntry: indexEntry, options: Options())
     }
 
     static func scan(path: String, excludedPrefixes: [String], cancelled: () -> Bool,
                      onEntry: (String, Bool) -> Void, onProgress: (Int, String) -> Void,
-                     onIOIntent: ((String) -> Void)? = nil, options: Options) -> ScanReport {
+                     onIOIntent: ((String) -> Void)? = nil,
+                     indexEntry: ((String, Bool) -> (changed: Bool, count: Int))? = nil,
+                     options: Options) -> ScanReport {
         let start = now()
         let root = path.isEmpty ? "" : URL(fileURLWithPath: path).standardized.path
         var exclusions = excludedPrefixes.filter { !$0.isEmpty }.map { URL(fileURLWithPath: $0).standardized.path }, issues: [ScanIssue] = [], totalIssues = 0
-        var seen: [String: Bool] = [:]
+        // A hosted scan uses its fresh staging index as the exact path/type
+        // ledger. Keeping another full-path dictionary here doubled scan memory.
+        // Generic callbacks have no ledger: preserve their single-pass count,
+        // and return incomplete on a timeout rather than replaying duplicates.
+        let retries = indexEntry == nil ? 0 : max(0, min(3, options.maximumTimeoutRetries))
+        var indexedCount = 0
         var latestPath = root
         func report(_ completed: Bool) -> ScanReport {
-            ScanReport(count: seen.count, issues: Array(issues.prefix(1000)), completed: completed,
+            ScanReport(count: indexedCount, issues: Array(issues.prefix(1000)), completed: completed,
                        elapsedMilliseconds: (now() - start) * 1000, totalIssueCount: totalIssues)
         }
         func issue(_ path: String, _ message: String) {
@@ -59,7 +67,7 @@ enum ScanWorker {
         }
         guard !cancelled() else { return report(false) }
         guard validPath(root) else { issue(root, "无法准备扫描路径"); return report(false) }
-        for attempt in 0...max(0, min(3, options.maximumTimeoutRetries)) {
+        for attempt in 0...retries {
             guard !cancelled() else { return report(false) }
             let request = Request(path: root, excludedPrefixes: exclusions,
                                   stallAtPath: attempt == 0 ? options.stallOnceAtPath : nil,
@@ -68,12 +76,17 @@ enum ScanWorker {
                 onEntry: { entry, directory in
                     guard !cancelled() else { return }
                     latestPath = entry
-                    // Retries share the caller's index. Emit each unchanged name
-                    // once; a real file/directory type change still updates it.
-                    if seen[entry] != directory { seen[entry] = directory; onEntry(entry, directory) }
+                    if let indexEntry {
+                        let accepted = indexEntry(entry, directory)
+                        indexedCount = max(0, accepted.count)
+                        if accepted.changed { onEntry(entry, directory) }
+                    } else {
+                        indexedCount += 1
+                        onEntry(entry, directory)
+                    }
                 }, onProgress: { _, path in
                     guard !cancelled() else { return }
-                    latestPath = path; onProgress(seen.count, path)
+                    latestPath = path; onProgress(indexedCount, path)
                 }, onIOIntent: { path in
                     guard !cancelled() else { return }; onIOIntent?(path)
                 }, childStarted: options.childStarted)
@@ -83,7 +96,7 @@ enum ScanWorker {
                 case .cancelled: return report(false)
                 case .timeout(let pending):
                     issue(pending, "目录读取超过时限，已终止本次读取并保留旧索引；下次扫描会重新尝试。")
-                    guard attempt < max(0, min(3, options.maximumTimeoutRetries)), pending != root,
+                    guard attempt < retries, pending != root,
                           !exclusions.contains(pending) else { return report(false) }
                     exclusions.append(pending)
                     continue
@@ -98,7 +111,7 @@ enum ScanWorker {
             }
             totalIssues += max(childReport.totalIssueCount, childReport.issues.count)
             issues += childReport.issues.prefix(max(0, 1000 - issues.count)).map { ScanIssue(path: $0.path, message: $0.message) }
-            if !cancelled() { onProgress(seen.count, latestPath) }
+            if !cancelled() { onProgress(indexedCount, latestPath) }
             return report(childReport.completed)
         }
         return report(false)

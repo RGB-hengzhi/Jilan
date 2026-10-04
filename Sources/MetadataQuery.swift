@@ -39,7 +39,7 @@ final class MetadataQuery: @unchecked Sendable {
     private let cacheLifetime: TimeInterval
     private let cacheCapacity: Int
 
-    init(cacheLifetime: TimeInterval = 10, cacheCapacity: Int = 100_000) {
+    init(cacheLifetime: TimeInterval = 10, cacheCapacity: Int = 8192) {
         self.cacheLifetime = max(0, cacheLifetime); self.cacheCapacity = max(1, cacheCapacity)
     }
 
@@ -99,42 +99,84 @@ final class MetadataQuery: @unchecked Sendable {
         return unknown ? nil : false
     }
 
-    /// The caller selects an explicit inspection budget. A short first pass lets
-    /// users see results promptly; "检查全部候选" supplies the full candidate list.
-    /// Progress is throttled, and cancellation is checked between every item.
+    /// A single background search owns this session. Only accepted display rows
+    /// survive a chunk: candidates and their attributes are released immediately.
+    /// It never holds an index lock while reading filesystem properties.
+    final class Session {
+        private let metadata: MetadataQuery
+        private let plan: AdvancedSearchPlan
+        private let matchPath: Bool
+        private let limit: Int
+        private let cancellation: CancellationFlag
+        private let readProperties: ((String) -> Properties?)?
+        private let onProgress: ((Progress) -> Void)?
+        private var hits: [FileHit] = []
+        private var count = 0, inspected = 0, offline = 0, unavailable = 0
+        private var totalCandidates: Int
+        private var reportedAt = Date(), reportedCount = 0
+
+        fileprivate init(metadata: MetadataQuery, totalCandidates: Int, plan: AdvancedSearchPlan,
+                         matchPath: Bool, limit: Int, cancellation: CancellationFlag,
+                         readProperties: ((String) -> Properties?)?, onProgress: ((Progress) -> Void)?) {
+            self.metadata = metadata; self.totalCandidates = max(0, totalCandidates)
+            self.plan = plan; self.matchPath = matchPath; self.limit = max(0, limit)
+            self.cancellation = cancellation; self.readProperties = readProperties; self.onProgress = onProgress
+            hits.reserveCapacity(min(self.limit, 2000))
+        }
+
+        func setTotalCandidates(_ count: Int) { totalCandidates = max(0, count) }
+
+        var progress: Progress {
+            Progress(hits: hits, totalMatches: count, inspected: inspected, totalCandidates: totalCandidates,
+                     offline: offline, unavailable: unavailable, cancelled: cancellation.isCancelled)
+        }
+
+        @discardableResult
+        func consume(_ candidates: [FileHit]) -> Bool {
+            for var hit in candidates {
+                if cancellation.isCancelled { return false }
+                inspected += 1
+                var accepted = plan.matches(hit, matchPath: matchPath, size: nil, modified: nil)
+                if accepted == nil {
+                    if !hit.isOnline { offline += 1 }
+                    else if let properties = readProperties?(hit.path) ?? (readProperties == nil
+                        ? metadata.properties(for: hit.path, includeHidden: plan.usesHiddenMetadata) : nil) {
+                        hit.size = hit.isDirectory ? nil : properties.size
+                        hit.modifiedDate = properties.modified
+                        hit.createdDate = properties.created
+                        accepted = plan.matches(hit, matchPath: matchPath, size: hit.size, modified: hit.modifiedDate,
+                                                created: hit.createdDate, hidden: properties.hidden)
+                    }
+                }
+                if accepted == true {
+                    count += 1
+                    if hits.count < limit { hits.append(hit) }
+                } else if accepted == nil && hit.isOnline { unavailable += 1 }
+                if inspected - reportedCount >= 5000 || Date().timeIntervalSince(reportedAt) >= 1 {
+                    onProgress?(progress); reportedAt = Date(); reportedCount = inspected
+                }
+            }
+            return !cancellation.isCancelled
+        }
+    }
+
+    func makeSession(totalCandidates: Int = 0, plan: AdvancedSearchPlan, matchPath: Bool, limit: Int,
+                     cancellation: CancellationFlag, readProperties: ((String) -> Properties?)? = nil,
+                     onProgress: ((Progress) -> Void)? = nil) -> Session {
+        Session(metadata: self, totalCandidates: totalCandidates, plan: plan, matchPath: matchPath,
+                limit: limit, cancellation: cancellation, readProperties: readProperties, onProgress: onProgress)
+    }
+
+    /// Compatibility entry point for a bounded first pass and existing callers.
+    /// Full sweeps use the same session across chunks rather than one huge array.
     func filter(_ candidates: [FileHit], totalCandidates: Int, plan: AdvancedSearchPlan,
                 matchPath: Bool, limit: Int, cancellation: CancellationFlag,
                 readProperties: ((String) -> Properties?)? = nil,
                 onProgress: ((Progress) -> Void)? = nil) -> Progress {
-        var hits: [FileHit] = [], count = 0, inspected = 0, offline = 0, unavailable = 0
-        hits.reserveCapacity(min(max(0, limit), candidates.count))
-        var reportedAt = Date(), reportedCount = 0
-        func progress(_ cancelled: Bool = false) -> Progress {
-            Progress(hits: hits, totalMatches: count, inspected: inspected, totalCandidates: totalCandidates,
-                     offline: offline, unavailable: unavailable, cancelled: cancelled)
-        }
-        for var hit in candidates {
-            if cancellation.isCancelled { return progress(true) }
-            inspected += 1
-            var accepted = plan.matches(hit, matchPath: matchPath, size: nil, modified: nil)
-            if accepted == nil {
-                if !hit.isOnline { offline += 1 }
-                else if let properties = readProperties?(hit.path) ?? (readProperties == nil ? self.properties(for: hit.path, includeHidden: plan.usesHiddenMetadata) : nil) {
-                    hit.size = hit.isDirectory ? nil : properties.size
-                    hit.modifiedDate = properties.modified
-                    hit.createdDate = properties.created
-                    accepted = plan.matches(hit, matchPath: matchPath, size: hit.size, modified: hit.modifiedDate,
-                                            created: hit.createdDate, hidden: properties.hidden)
-                }
-            }
-            if accepted == true {
-                count += 1
-                if hits.count < max(0, limit) { hits.append(hit) }
-            } else if accepted == nil && hit.isOnline { unavailable += 1 }
-            if inspected - reportedCount >= 5000 || Date().timeIntervalSince(reportedAt) >= 1 {
-                onProgress?(progress()); reportedAt = Date(); reportedCount = inspected
-            }
-        }
-        return progress(cancellation.isCancelled)
+        let session = makeSession(totalCandidates: totalCandidates, plan: plan, matchPath: matchPath,
+                                  limit: limit, cancellation: cancellation, readProperties: readProperties,
+                                  onProgress: onProgress)
+        session.consume(candidates)
+        return session.progress
     }
 }

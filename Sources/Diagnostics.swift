@@ -1,10 +1,11 @@
 import Foundation
 import AppKit
+import Darwin
 
 enum Diagnostic {
     static func run(arguments: [String]) -> Int32 {
         do {
-            var report: [String: Any] = ["application": Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "疾览 · Jilan", "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.2.1", "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
+            var report: [String: Any] = ["application": Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "疾览 · Jilan", "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.2.2", "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
                 "testedAt": ISO8601DateFormatter().string(from: Date()),
                 "architecture": "arm64", "os": ProcessInfo.processInfo.operatingSystemVersionString]
             if arguments.contains("--self-test") || arguments.contains("--benchmark") {
@@ -14,6 +15,7 @@ enum Diagnostic {
                 report["pathCoverage"] = try PathCoverageTests.run()
                 report["advancedSearch"] = try AdvancedSearchTests.run()
                 report["filterUpgrade"] = try FilterUpgradeTests.run()
+                report["metadataStreaming"] = try MetadataStreamingTests.run()
                 report["operationIndexRefresh"] = try OperationIndexRefreshTests.run()
                 report["scannerSafety"] = try ScannerSafetyTests.run()
                 report["scanWorker"] = try ScanWorkerTests.run()
@@ -22,6 +24,7 @@ enum Diagnostic {
                 report["searchPreferences"] = try SearchPreferencesTests.run()
                 report["workspaceSession"] = try WorkspaceSessionTests.run()
                 report["idleSearch"] = try MainActor.assumeIsolated { try IdleSearchTests.run() }
+                report["backgroundReads"] = try MainActor.assumeIsolated { try BackgroundReadCancellationTests.run() }
                 try FilesystemTests.run()
                 report["filesystem"] = "passed: real APFS and configured external volume"
                 report["integration"] = try integrationTest()
@@ -33,7 +36,10 @@ enum Diagnostic {
                 let path = arguments[position + 1]
                 let index = EngineIndex()
                 let scan = FileScanner.scan(path: path, excludedPrefixes: [], cancelled: { false },
-                    onEntry: { index.add(path: $0, isDirectory: $1) }, onProgress: { _, _ in })
+                    onEntry: { _, _ in }, onProgress: { _, _ in }, indexEntry: { path, directory in
+                        let changed = index.add(path: path, isDirectory: directory)
+                        return (changed, index.count)
+                    })
                 let term = arguments.firstIndex(of: "--query").flatMap { arguments.count > $0 + 1 ? arguments[$0 + 1] : nil } ?? ""
                 let start = DispatchTime.now().uptimeNanoseconds
                 let query = index.query(SearchRequest(query: term), rootID: "diagnostic", limit: 20)
@@ -46,6 +52,7 @@ enum Diagnostic {
                     "issues": scan.issues.prefix(20).map { ["path": $0.path, "message": $0.message] }]
             }
             if arguments.contains("--cache-diagnostic") {
+                let memoryBeforeLoad = currentMemory()
                 let directory = arguments.firstIndex(of: "--index-data").flatMap { arguments.count > $0 + 1 ? arguments[$0 + 1] : nil }
                     ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/QuickFind").path
                 let urls = try FileManager.default.contentsOfDirectory(at: URL(fileURLWithPath: directory), includingPropertiesForKeys: nil)
@@ -53,6 +60,7 @@ enum Diagnostic {
                 var entries = 0
                 var measurements: [[String: Any]] = []
                 let engines = try urls.map { try EngineIndex.load(from: $0) }
+                let memoryAfterLoad = currentMemory()
                 entries = engines.reduce(0) { $0 + $1.count }
                 for query in ["应用", "合同 *.pdf !草稿", "*.docx | *.pdf", "QuickFindV2验收"] {
                     let start = DispatchTime.now().uptimeNanoseconds
@@ -64,7 +72,9 @@ enum Diagnostic {
                         "milliseconds": Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000])
                 }
                 report["existingIndexQueries"] = ["indexCount": engines.count, "entries": entries,
-                    "measurements": measurements, "mode": "read-only cache; does not prove current filesystem coverage"]
+                    "measurements": measurements, "mode": "read-only cache; does not prove current filesystem coverage",
+                    "memory": ["beforeLoad": memoryBeforeLoad, "afterLoad": memoryAfterLoad,
+                               "afterQueries": withExtendedLifetime(engines) { currentMemory() }]]
             }
             report["result"] = "passed"
             let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
@@ -77,6 +87,19 @@ enum Diagnostic {
             fputs("FAIL: \(error)\n", stderr)
             return 1
         }
+    }
+
+    /// The app's own task can be inspected without debugger permissions. RSS
+    /// includes clean file-backed pages; footprint is recorded separately.
+    private static func currentMemory() -> [String: UInt64] {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let status = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        return status == KERN_SUCCESS ? ["footprintBytes": info.phys_footprint, "residentBytes": info.resident_size] : [:]
     }
 
     private static func integrationTest() throws -> [String: Any] {

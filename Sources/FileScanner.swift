@@ -18,10 +18,11 @@ enum FileScanner {
         cancelled: () -> Bool,
         onEntry: (String, Bool) -> Void,
         onProgress: (Int, String) -> Void,
-        onIOIntent: ((String) -> Void)? = nil
+        onIOIntent: ((String) -> Void)? = nil,
+        indexEntry: ((String, Bool) -> (changed: Bool, count: Int))? = nil
     ) -> ScanReport {
         ScanWorker.scan(path: path, excludedPrefixes: excludedPrefixes, cancelled: cancelled,
-                        onEntry: onEntry, onProgress: onProgress, onIOIntent: onIOIntent)
+                        onEntry: onEntry, onProgress: onProgress, onIOIntent: onIOIntent, indexEntry: indexEntry)
     }
 
     /// A physical name-only walk. Directory descriptors anchor each descent;

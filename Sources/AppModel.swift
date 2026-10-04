@@ -147,16 +147,15 @@ final class AppModel: NSObject {
         let limit = resultLimit
         let metadata = metadataQuery
         let inspectAll = inspectAllMetadata
-        let candidateLimit = inspectAll ? Int.max : max(20_000, limit * 10)
+        let candidateLimit = inspectAll ? Int.max : max(20_000, limit > Int.max / 10 ? Int.max : limit * 10)
         let work = DispatchWorkItem { [weak self] in
             guard !cancellation.isCancelled else { return }
             let start = Date()
-            var result = store.search(request, limit: plan.usesMetadata ? candidateLimit : limit)
-            guard !cancellation.isCancelled else { return }
+            var result: SearchBatch
             var propertyProgress: MetadataQuery.Progress?
             if plan.usesMetadata {
-                propertyProgress = metadata.filter(result.hits, totalCandidates: result.totalMatches, plan: plan,
-                    matchPath: request.matchPath, limit: limit, cancellation: cancellation, onProgress: { progress in
+                let session = metadata.makeSession(plan: plan, matchPath: request.matchPath,
+                    limit: limit, cancellation: cancellation, onProgress: { progress in
                         DispatchQueue.main.async { [weak self] in
                             guard let self, self.searchGeneration == generation, !self.stopped,
                                   !cancellation.isCancelled, self.searchSignature == key else { return }
@@ -170,10 +169,16 @@ final class AppModel: NSObject {
                             self.onChange?()
                         }
                     })
+                // Both the first inspection and the explicit full sweep keep
+                // only one bounded candidate chunk, plus accepted display rows.
+                _ = store.forEachCandidate(request, chunkSize: 2000, maximumCandidates: candidateLimit,
+                    onStart: { session.setTotalCandidates($0) }, onChunk: { session.consume($0) })
+                propertyProgress = session.progress
                 guard !cancellation.isCancelled, let progress = propertyProgress, !progress.cancelled else { return }
                 result = SearchBatch(hits: progress.hits, totalMatches: progress.totalMatches,
                                      elapsedMilliseconds: Date().timeIntervalSince(start) * 1000)
-            }
+            } else { result = store.search(request, limit: limit) }
+            guard !cancellation.isCancelled else { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.searchGeneration == generation, !self.stopped,
                     !cancellation.isCancelled, self.searchSignature == key else { return }

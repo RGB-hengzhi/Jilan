@@ -16,10 +16,17 @@ final class EngineIndex: @unchecked Sendable {
     /// complete snapshot was visited; callbacks run without the index lock.
     @discardableResult
     func forEachPathWhile(_ visit: (String, Bool) -> Bool) -> Bool { engine.forEachPathWhile(visit) }
-    func add(path: String, isDirectory: Bool) { engine.addPath(path, isDir: isDirectory) }
+    @discardableResult
+    func add(path: String, isDirectory: Bool) -> Bool { engine.addIfChanged(path, isDir: isDirectory) }
+    func pathIsDirectory(_ path: String) -> Bool? { engine.pathIsDirectory(path) }
+    func reserveCapacity(_ expected: Int) { engine.reserveCapacity(expected) }
+    func makeQueryCursor(_ request: SearchRequest, rootID: String,
+                         excludeHit: ((String) -> Bool)? = nil) -> SearchEngine.QueryCursor {
+        engine.makeQueryCursor(request, rootID: rootID, excludeHit: excludeHit)
+    }
     func removeSubtree(path: String) { engine.removeSubtree(path) }
-    /// excludeHit cannot re-enter this index. When checking other indexes, the
-    /// caller must enforce a stable lock order for all simultaneous searches.
+    /// Queries use a captured compact snapshot; exclusion callbacks are unlocked
+    /// and may re-enter this index. Use cursor membership for version consistency.
     func query(_ request: SearchRequest, rootID: String, limit: Int,
                excludeHit: ((String) -> Bool)? = nil) -> EngineQueryResult {
         engine.literalQuery(request, rootID: rootID, limit: limit, excludeHit: excludeHit)

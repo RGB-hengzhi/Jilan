@@ -6,6 +6,33 @@ struct ResultMetadata {
     var modified: Date?
 }
 
+struct ResultMetadataReadTestHooks {
+    var beforeRead: ((String) -> Void)?
+}
+
+/// Read by the worker, cancelled by the main actor. No actor-isolated state is
+/// touched while a filesystem read is in progress.
+private final class ResultMetadataReadToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    var isCancelled: Bool {
+        lock.lock(); defer { lock.unlock() }; return cancelled
+    }
+}
+
+/// Mutated by the owning main-actor cache, or during its exclusive teardown.
+private final class ResultMetadataCacheEntry {
+    let path: String
+    var metadata: ResultMetadata
+    var updated: Date
+    weak var previous: ResultMetadataCacheEntry?
+    var next: ResultMetadataCacheEntry?
+    init(path: String, metadata: ResultMetadata, updated: Date) {
+        self.path = path; self.metadata = metadata; self.updated = updated
+    }
+}
+
 /// Only the visible result rows (or the loaded rows explicitly being sorted)
 /// request attributes. The filename index never waits for these reads.
 @MainActor
@@ -17,43 +44,131 @@ final class ResultMetadataCache {
         value.dateFormat = "yyyy-MM-dd HH:mm"
         return value
     }()
+    static let defaultCapacity = 4_096
+    static let maximumCapacity = 50_000
     private let queue = DispatchQueue(label: "cn.local.quickfind.result-attributes", qos: .utility)
-    private var values: [String: (ResultMetadata, Date)] = [:]
+    private let testHooks: ResultMetadataReadTestHooks?
+    private var values: [String: ResultMetadataCacheEntry] = [:]
+    private var oldest: ResultMetadataCacheEntry?
+    private var newest: ResultMetadataCacheEntry?
     private var pending = Set<String>()
-    private var generation = 0
+    private var waiting: [String?] = []
+    private var waitingHead = 0
+    private var readToken = ResultMetadataReadToken()
+    private var isReading = false
+    private(set) var cacheCapacity = defaultCapacity
+    var cachedEntryCount: Int { values.count }
+    var pendingEntryCount: Int { pending.count }
+
+    init(testHooks: ResultMetadataReadTestHooks? = nil) { self.testHooks = testHooks }
+
+    deinit {
+        readToken.cancel()
+        var entry = oldest
+        while let current = entry {
+            entry = current.next; current.next = nil; current.previous = nil
+        }
+    }
+
     func value(path: String) -> ResultMetadata? {
-        guard let cached = values[path], Date().timeIntervalSince(cached.1) < 10 else { return nil }
-        return cached.0
+        guard let cached = values[path], Date().timeIntervalSince(cached.updated) < 10 else { return nil }
+        touch(cached)
+        return cached.metadata
     }
     func invalidate() {
-        generation += 1; values.removeAll(); pending.removeAll()
+        readToken.cancel(); readToken = ResultMetadataReadToken()
+        // Unlink first, avoiding a long recursive ARC chain on a large sort.
+        var entry = oldest
+        while let current = entry {
+            entry = current.next; current.next = nil; current.previous = nil
+        }
+        oldest = nil; newest = nil; values.removeAll()
+        pending.removeAll(); waiting.removeAll(); waitingHead = 0
+        cacheCapacity = Self.defaultCapacity
     }
     func load(paths: [String]) {
-        let targets = paths.filter { value(path: $0) == nil && pending.insert($0).inserted }
+        // A normal visible-row request stays small. Explicit sorting of loaded
+        // rows can retain their properties, up to the previous 50,000 limit.
+        cacheCapacity = max(cacheCapacity, min(Self.maximumCapacity, paths.count))
+        for path in paths {
+            guard pending.count < Self.maximumCapacity else { break }
+            if value(path: path) == nil && pending.insert(path).inserted { waiting.append(path) }
+        }
+        readNextBatch()
+    }
+
+    private func readNextBatch() {
+        guard !isReading, waitingHead < waiting.count else { return }
+        var targets: [String] = []
+        targets.reserveCapacity(100)
+        while targets.count < 100 && waitingHead < waiting.count {
+            if let path = waiting[waitingHead] { targets.append(path) }
+            waiting[waitingHead] = nil; waitingHead += 1
+        }
+        if waitingHead == waiting.count { waiting.removeAll(); waitingHead = 0 }
+        else if waitingHead >= 1_024 && waitingHead * 2 >= waiting.count {
+            waiting = Array(waiting.dropFirst(waitingHead)); waitingHead = 0
+        }
         guard !targets.isEmpty else { return }
-        let expectedGeneration = generation
+        isReading = true
+        let token = readToken
+        let hooks = testHooks
         queue.async { [weak self] in
             var batch: [(String, ResultMetadata)] = []
-            func publish() {
-                let snapshot = batch; batch.removeAll(keepingCapacity: true)
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.generation == expectedGeneration else { return }
-                    if self.values.count > 50_000 { self.values.removeAll() }
-                    let now = Date()
-                    for (path, metadata) in snapshot {
-                        self.values[path] = (metadata, now); self.pending.remove(path)
-                    }
-                    self.onChange?()
-                }
-            }
+            batch.reserveCapacity(targets.count)
             for path in targets {
+                guard !token.isCancelled else { break }
+                hooks?.beforeRead?(path)
+                guard !token.isCancelled else { break }
                 let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+                guard !token.isCancelled else { break }
                 batch.append((path, ResultMetadata(size: (attributes?[.size] as? NSNumber)?.int64Value,
                                                    modified: attributes?[.modificationDate] as? Date)))
-                if batch.count >= 100 { publish() }
             }
-            if !batch.isEmpty { publish() }
+            let snapshot = batch
+            // Schedule the next read only after this batch is accepted on the
+            // main actor: at most one result batch can wait for the UI.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.isReading = false
+                if self.readToken === token && !token.isCancelled {
+                    let now = Date()
+                    for (path, metadata) in snapshot {
+                        if let entry = self.values[path] {
+                            entry.metadata = metadata; entry.updated = now; self.touch(entry)
+                        } else {
+                            let entry = ResultMetadataCacheEntry(path: path, metadata: metadata, updated: now)
+                            self.values[path] = entry; self.append(entry)
+                        }
+                        self.pending.remove(path)
+                    }
+                    self.trimCache()
+                    if !snapshot.isEmpty { self.onChange?() }
+                }
+                self.readNextBatch()
+            }
         }
+    }
+
+    private func trimCache() {
+        while values.count > cacheCapacity, let entry = oldest {
+            oldest = entry.next; oldest?.previous = nil
+            entry.next = nil; values.removeValue(forKey: entry.path)
+            if oldest == nil { newest = nil }
+        }
+    }
+
+    private func touch(_ entry: ResultMetadataCacheEntry) {
+        guard newest !== entry else { return }
+        if let previous = entry.previous { previous.next = entry.next }
+        else { oldest = entry.next }
+        entry.next?.previous = entry.previous
+        entry.previous = nil; entry.next = nil; append(entry)
+    }
+
+    private func append(_ entry: ResultMetadataCacheEntry) {
+        entry.previous = newest; newest?.next = entry; newest = entry
+        if oldest == nil { oldest = entry }
     }
 }
 

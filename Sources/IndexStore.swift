@@ -46,8 +46,13 @@ final class IndexStore: @unchecked Sendable {
     private var token = CancellationFlag()
     private var watcher: FileWatcher?
     private var watcherToken = CancellationFlag()
-    private var pendingEvents: [FileChange] = []
+    // The index worker can be busy calibrating a large root. Keep at most one
+    // dispatched batch and one bounded, coalesced batch in front of it.
+    static let maximumPendingEventPaths = 5000
+    private var pendingEvents: [String: FileChange] = [:]
+    private var pendingCalibrations: [String: String] = [:]
     private var eventWork: DispatchWorkItem?
+    private var eventDrainInFlight = false
     private var observers: [NSObjectProtocol] = []
     private var timer: DispatchSourceTimer?
     private let lifecycle = CancellationFlag()
@@ -85,11 +90,9 @@ final class IndexStore: @unchecked Sendable {
     static func wholeDisks() -> [RootRecord] {
         var roots = [makeRoot(path: "/", name: "内置硬盘")]
         let urls = FileManager.default.mountedVolumeURLs(
-            includingResourceValuesForKeys: [.volumeIsLocalKey, .volumeIsBrowsableKey],
+            includingResourceValuesForKeys: [.volumeIsLocalKey, .volumeIsBrowsableKey, .volumeIsReadOnlyKey, .volumeURLKey],
             options: [.skipHiddenVolumes]) ?? []
-        for url in urls where url.path.hasPrefix("/Volumes/") {
-            let values = try? url.resourceValues(forKeys: [.volumeIsLocalKey, .volumeIsBrowsableKey])
-            guard values?.volumeIsLocal != false, values?.volumeIsBrowsable != false else { continue }
+        for url in urls where isAutoDiscoverableVolume(url) {
             roots.append(makeRoot(path: url.path))
         }
         return roots
@@ -224,10 +227,12 @@ final class IndexStore: @unchecked Sendable {
             if statuses[record.id]?.isOnline != true { searchRevision &+= 1 }
             statuses[record.id]?.state = "扫描中"
             statuses[record.id]?.isOnline = true
-            lock.unlock(); publish()
+            lock.unlock()
+            if let previous { engine.reserveCapacity(previous.count) }
+            publish()
             let report = FileScanner.scan(path: record.path, excludedPrefixes: exclusions(for: record),
                 cancelled: { scanToken.isCancelled || self.stopped },
-                onEntry: { path, isDir in engine.add(path: path, isDirectory: isDir) },
+                onEntry: { _, _ in },
                 onProgress: { count, path in
                     self.lock.lock(); self.progressCount = processed + count
                     if previous == nil {
@@ -236,6 +241,8 @@ final class IndexStore: @unchecked Sendable {
                     }
                     self.message = "扫描 \(record.name)：\(path)"
                     self.lock.unlock(); self.publish()
+                }, indexEntry: { path, isDir in
+                    Self.acceptScannedEntry(path, directory: isDir, into: engine)
                 })
             processed += report.count
             if !report.completed && !scanToken.isCancelled { interrupted = true }
@@ -251,7 +258,9 @@ final class IndexStore: @unchecked Sendable {
                     if retainAllMissing || inaccessible.contains(path) {
                         // Fresh scan entries (including changed file types)
                         // always take priority over cached entries.
-                        if !engine.hasPath(path) { engine.add(path: path, isDirectory: isDir) }
+                        if !engine.hasPath(path) && !Self.hasFileAncestor(path, in: engine) {
+                            engine.add(path: path, isDirectory: isDir)
+                        }
                     }
                     return true
                 }
@@ -296,6 +305,24 @@ final class IndexStore: @unchecked Sendable {
         else if interrupted { message = "本次校准未完整结束，已保留索引。请查看未覆盖路径并重新扫描。" }
         else { message = "索引已就绪。未获权限的位置请查看扫描问题；离线结果来自上次索引。" }
         lock.unlock(); publish()
+    }
+
+    private static func hasFileAncestor(_ path: String, in engine: EngineIndex) -> Bool {
+        var parent = (path as NSString).deletingLastPathComponent
+        while !parent.isEmpty {
+            if engine.pathIsDirectory(parent) == false { return true }
+            if parent == "/" { break }
+            parent = (parent as NSString).deletingLastPathComponent
+        }
+        return false
+    }
+
+    private static func acceptScannedEntry(_ path: String, directory: Bool, into engine: EngineIndex) -> (changed: Bool, count: Int) {
+        // A retry can observe a directory now replaced by a file/link. Remove
+        // its previously staged descendants; the old published index stays safe.
+        if !directory && engine.pathIsDirectory(path) == true { engine.removeSubtree(path: path) }
+        let changed = engine.add(path: path, isDirectory: directory)
+        return (changed, engine.count)
     }
 
     func refreshAll() {
@@ -351,8 +378,7 @@ final class IndexStore: @unchecked Sendable {
         return !exclusions(for: ancestor).contains { descendant.path == $0 || descendant.path.hasPrefix($0 + "/") }
     }
 
-    func search(_ request: SearchRequest, limit: Int = 2000) -> SearchBatch {
-        let start = DispatchTime.now().uptimeNanoseconds
+    private func querySources(_ request: SearchRequest) -> [(RootRecord, EngineIndex, Bool)] {
         lock.lock()
         let candidates = Self.uniqueRoots(records).filter { record in
             guard request.rootID == nil || record.id == request.rootID else { return false }
@@ -372,6 +398,63 @@ final class IndexStore: @unchecked Sendable {
             return (record, engine, statuses[record.id]?.isOnline ?? false)
         }
         lock.unlock()
+        return sources
+    }
+
+    struct CandidateStreamResult {
+        let totalCandidates: Int
+        let processedCandidates: Int
+        let completed: Bool
+        let elapsedMilliseconds: Double
+    }
+
+    /// Counts and streams the same immutable index snapshots. At most 2,000
+    /// candidate hits exist in the stream at once; metadata work runs without
+    /// holding an index lock. Narrower-root membership also uses its captured
+    /// snapshot so a concurrent file update cannot change duplicate accounting.
+    func forEachCandidate(_ request: SearchRequest, chunkSize: Int = 2000,
+                          maximumCandidates: Int = Int.max,
+                          onStart: ((Int) -> Void)? = nil,
+                          onChunk: ([FileHit]) -> Bool) -> CandidateStreamResult {
+        let start = DispatchTime.now().uptimeNanoseconds
+        let sources = querySources(request)
+        var snapshots: [(RootRecord, SearchEngine.QueryCursor, Bool)] = []
+        for (record, engine, online) in sources {
+            let overlap = snapshots.filter { covers(record, $0.0) }.map { $0.1 }
+            let cursor = engine.makeQueryCursor(request, rootID: record.id,
+                excludeHit: overlap.isEmpty ? nil : { path in overlap.contains { $0.hasPath(path) } })
+            snapshots.append((record, cursor, online))
+        }
+        var total = 0, processed = 0
+        func result(_ completed: Bool) -> CandidateStreamResult {
+            CandidateStreamResult(totalCandidates: total, processedCandidates: processed, completed: completed,
+                elapsedMilliseconds: Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000)
+        }
+        for (_, cursor, _) in snapshots {
+            guard request.cancellation?.isCancelled != true else { return result(false) }
+            total += cursor.countCandidates()
+        }
+        guard request.cancellation?.isCancelled != true else { return result(false) }
+        onStart?(total)
+        let size = max(1, min(2000, chunkSize)), maximum = max(0, maximumCandidates)
+        for (_, cursor, online) in snapshots {
+            while processed < maximum && !cursor.isComplete {
+                guard request.cancellation?.isCancelled != true else { return result(false) }
+                var hits = cursor.next(maximum: min(size, maximum - processed))
+                guard request.cancellation?.isCancelled != true else { return result(false) }
+                guard !hits.isEmpty else { break }
+                for index in hits.indices { hits[index].isOnline = online }
+                processed += hits.count
+                guard onChunk(hits) else { return result(false) }
+            }
+            if processed >= maximum { break }
+        }
+        return result(request.cancellation?.isCancelled != true && processed == total)
+    }
+
+    func search(_ request: SearchRequest, limit: Int = 2000) -> SearchBatch {
+        let start = DispatchTime.now().uptimeNanoseconds
+        let sources = querySources(request)
         var hits: [FileHit] = [], total = 0
         var previous: [(RootRecord, EngineIndex)] = []
         for (record, engine, online) in sources {
@@ -449,21 +532,95 @@ final class IndexStore: @unchecked Sendable {
         }
     }
 
-    private func enqueueChanges(_ changes: [FileChange]) {
-        eventsQueue.async { [weak self] in
+    /// File events are hints from the watcher, not a durable journal. Once a
+    /// batch exceeds its path budget, explicitly calibrate the affected roots
+    /// instead of silently dropping names or queuing unbounded arrays.
+    func enqueueChanges(_ changes: [FileChange]) {
+        // The watcher invokes this on its own queue. Apply backpressure here
+        // rather than retaining another unbounded queue of raw event arrays.
+        eventsQueue.sync { [weak self] in
             guard let self, !self.stopped else { return }
-            self.pendingEvents += changes
-            // A continuous stream must still update at bounded intervals.
-            guard self.eventWork == nil else { return }
-            let work = DispatchWorkItem { [weak self] in
-                guard let self else { return }
-                let events = self.pendingEvents; self.pendingEvents.removeAll()
-                self.eventWork = nil
-                self.worker.async { [weak self] in self?.applyChanges(events) }
+            self.lock.lock(); let roots = self.records; self.lock.unlock()
+            let globalLoss = UInt32(kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagEventIdsWrapped)
+            for change in changes {
+                if change.flags & globalLoss != 0 {
+                    for root in roots { self.pendingCalibrations[root.id] = root.path }
+                    self.pendingEvents.removeAll(keepingCapacity: false)
+                    continue
+                }
+                let affected = roots.filter { root in
+                    if change.requiresFullScan && Self.path(change.path, contains: root.path) { return true }
+                    return Self.path(root.path, contains: change.path)
+                        && !self.exclusions(for: root).contains { Self.path($0, contains: change.path) }
+                }
+                guard !affected.isEmpty else { continue }
+                if change.requiresFullScan {
+                    for root in affected { self.pendingCalibrations[root.id] = root.path }
+                    self.removeCalibratedEvents()
+                    continue
+                }
+                if self.pendingCalibrations.values.contains(where: { Self.path($0, contains: change.path) }) { continue }
+                let previous = self.pendingEvents[change.path]
+                self.pendingEvents[change.path] = FileChange(path: change.path,
+                    flags: (previous?.flags ?? 0) | change.flags,
+                    requiresFullScan: previous?.requiresFullScan == true || change.requiresFullScan)
+                if self.pendingEvents.count > Self.maximumPendingEventPaths {
+                    // Promote only roots touched by this pending batch. The
+                    // path dictionary is released before subsequent events.
+                    for root in roots where self.pendingEvents.keys.contains(where: { Self.path(root.path, contains: $0) }) {
+                        self.pendingCalibrations[root.id] = root.path
+                    }
+                    self.removeCalibratedEvents()
+                }
             }
-            self.eventWork = work
-            self.eventsQueue.asyncAfter(deadline: .now() + 1.5, execute: work)
+            self.scheduleEventDrain()
         }
+    }
+
+    private static func path(_ ancestor: String, contains descendant: String) -> Bool {
+        descendant == ancestor || descendant.hasPrefix(ancestor == "/" ? "/" : ancestor + "/")
+    }
+
+    // All three methods below run only on eventsQueue. Changes received after a
+    // batch is captured remain pending until that batch has completely applied.
+    private func removeCalibratedEvents() {
+        pendingEvents = pendingEvents.filter { key, _ in
+            !pendingCalibrations.values.contains { Self.path($0, contains: key) }
+        }
+    }
+
+    private func scheduleEventDrain() {
+        guard !stopped, !eventDrainInFlight, eventWork == nil,
+              !pendingEvents.isEmpty || !pendingCalibrations.isEmpty else { return }
+        let work = DispatchWorkItem { [weak self] in self?.drainEvents() }
+        eventWork = work
+        eventsQueue.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
+    private func drainEvents() {
+        eventWork = nil
+        guard !stopped, !eventDrainInFlight else { return }
+        let events = Array(pendingEvents.values)
+            + pendingCalibrations.values.map { FileChange(path: $0, flags: 0, requiresFullScan: true) }
+        pendingEvents.removeAll(keepingCapacity: false)
+        pendingCalibrations.removeAll(keepingCapacity: false)
+        guard !events.isEmpty else { return }
+        eventDrainInFlight = true
+        worker.async { [weak self] in
+            guard let self else { return }
+            self.applyChanges(events)
+            self.eventsQueue.async { [weak self] in
+                guard let self else { return }
+                self.eventDrainInFlight = false
+                self.scheduleEventDrain()
+            }
+        }
+    }
+
+    /// Lightweight diagnostics for the real aggregation queue, useful for
+    /// verifying its memory bound while a calibration occupies the worker.
+    func eventBacklogSnapshot() -> (pendingPaths: Int, pendingRoots: Int, inFlight: Bool) {
+        eventsQueue.sync { (pendingEvents.count, pendingCalibrations.count, eventDrainInFlight) }
     }
 
     private func applyChanges(_ changes: [FileChange]) {
@@ -523,7 +680,8 @@ final class IndexStore: @unchecked Sendable {
                     if attributes.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) {
                         let staged = EngineIndex()
                         let report = FileScanner.scan(path: currentPath, excludedPrefixes: exclusions(for: record),
-                            cancelled: { self.stopped || incrementalToken.isCancelled }, onEntry: { staged.add(path: $0, isDirectory: $1) }, onProgress: { _, _ in })
+                            cancelled: { self.stopped || incrementalToken.isCancelled }, onEntry: { _, _ in }, onProgress: { _, _ in },
+                            indexEntry: { Self.acceptScannedEntry($0, directory: $1, into: staged) })
                         guard report.completed && !incrementalToken.isCancelled && !stopped else {
                             rootInterrupted = true
                             lock.lock()
@@ -614,27 +772,103 @@ final class IndexStore: @unchecked Sendable {
         lock.unlock()
     }
 
+    struct VolumeEventPlan {
+        let affectedRootIDs: Set<String>
+        let shouldDiscover: Bool
+    }
+
+    /// Pure scope decision. Injecting eligibility permits owned fixture tests
+    /// without mounting anything or starting a scan of the system root.
+    static func planVolumeEvent(roots: [RootRecord], at url: URL, mounted: Bool,
+                               discoveredRootID: String? = nil,
+                               eligibility: (URL) -> Bool = isAutoDiscoverableVolume) -> VolumeEventPlan {
+        guard url.isFileURL, url.path.hasPrefix("/"), !url.path.isEmpty else {
+            return VolumeEventPlan(affectedRootIDs: [], shouldDiscover: false)
+        }
+        let volumePath = url.standardized.path
+        let affected = Set(roots.filter { path(volumePath, contains: $0.path) }.map(\.id))
+        // A mount point can be reused by a different volume UUID. Identity,
+        // rather than its path, decides whether it is an already known root.
+        // Without an identity this is a discovery candidate; the handler probes
+        // only this URL and performs the final ID check before adding anything.
+        let newIdentity = discoveredRootID.map { id in !roots.contains { $0.id == id } } ?? true
+        let discover = mounted && roots.contains { $0.path == "/" } && newIdentity && eligibility(url)
+        return VolumeEventPlan(affectedRootIDs: affected, shouldDiscover: discover)
+    }
+
+    static func eligibleVolumeProperties(local: Bool?, browsable: Bool?, readOnly: Bool?) -> Bool {
+        local == true && browsable == true && readOnly == false
+    }
+
+    /// Automatic discovery excludes installation images and unknown volumes.
+    /// A manually configured read-only root can still be searched/reconnected.
+    static func isAutoDiscoverableVolume(_ url: URL) -> Bool {
+        guard url.isFileURL, url.standardized.path.hasPrefix("/Volumes/"),
+              let values = try? url.resourceValues(forKeys: [.volumeIsLocalKey, .volumeIsBrowsableKey,
+                                                            .volumeIsReadOnlyKey, .volumeURLKey]),
+              eligibleVolumeProperties(local: values.volumeIsLocal, browsable: values.volumeIsBrowsable,
+                                       readOnly: values.volumeIsReadOnly),
+              values.volume?.standardized.path == url.standardized.path else { return false }
+        return true
+    }
+
+    /// Handle only this notification's volume. A custom folder scope must never
+    /// become whole-disk indexing simply because an unrelated DMG was mounted.
+    func handleVolumeEvent(at url: URL, mounted: Bool,
+                           eligibility: @escaping (URL) -> Bool = IndexStore.isAutoDiscoverableVolume,
+                           completion: (() -> Void)? = nil) {
+        worker.async { [weak self] in
+            guard let self, !self.stopped else { completion?(); return }
+            defer { completion?() }
+            self.lock.lock(); let configured = self.records; self.lock.unlock()
+            let plan = Self.planVolumeEvent(roots: configured, at: url, mounted: mounted, eligibility: eligibility)
+            var affected = configured.filter { plan.affectedRootIDs.contains($0.id) }
+            var added = false
+            if plan.shouldDiscover {
+                // Read only the notified volume, never enumerate all mounted
+                // disks. makeRoot preserves canonical spelling and volume ID.
+                let discovered = Self.makeRoot(path: url.path)
+                self.lock.lock()
+                if !self.records.contains(where: { $0.id == discovered.id }) {
+                    self.records.append(discovered)
+                    self.statuses[discovered.id] = RootStatus(record: discovered)
+                    self.searchRevision &+= 1
+                    affected.append(discovered); added = true
+                }
+                self.lock.unlock()
+            }
+            guard !affected.isEmpty else { return }
+            var targets: [RootRecord] = []
+            for record in affected {
+                let online = mounted && self.isOnline(record)
+                self.lock.lock()
+                if self.statuses[record.id]?.isOnline != online { self.searchRevision &+= 1 }
+                self.statuses[record.id]?.isOnline = online
+                self.statuses[record.id]?.state = online ? "等待校准" : "磁盘离线"
+                self.lock.unlock()
+                if online { targets.append(record) }
+            }
+            if added {
+                do { try self.writeConfig() }
+                catch { self.setMessage("新增磁盘位置保存失败：\(error.localizedDescription)") }
+            }
+            self.restartWatcher(); self.publish()
+            guard mounted, !targets.isEmpty else { return }
+            self.lock.lock()
+            let next = self.token.isCancelled ? CancellationFlag() : self.token
+            self.token = next; self.lock.unlock()
+            self.scan(targets, token: next)
+        }
+    }
+
     private func installVolumeObservers() {
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
-            observers.append(center.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
-                self?.worker.async { [weak self] in
-                    guard let self, !self.stopped else { return }
-                    if name == NSWorkspace.didMountNotification {
-                        let discovered = Self.wholeDisks()
-                        self.lock.lock()
-                        for record in discovered where !self.records.contains(where: { $0.id == record.id }) {
-                            self.records.append(record); self.statuses[record.id] = RootStatus(record: record)
-                            self.searchRevision &+= 1
-                        }
-                        self.lock.unlock()
-                        try? self.writeConfig()
-                    }
-                    self.updateOnlineStatuses(); self.restartWatcher(); self.publish()
-                    self.lock.lock(); let targets = self.records.filter { self.isOnline($0) }
-                    let next = self.token.isCancelled ? CancellationFlag() : self.token; self.token = next; self.lock.unlock()
-                    self.scan(targets, token: next)
-                }
+            observers.append(center.addObserver(forName: name, object: nil, queue: nil) { [weak self] notification in
+                // Without the event URL there is no safe affected scope; do not
+                // substitute a discovery of every disk or a full calibration.
+                guard let url = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL else { return }
+                self?.handleVolumeEvent(at: url, mounted: name == NSWorkspace.didMountNotification)
             })
         }
     }
@@ -686,6 +920,11 @@ final class IndexStore: @unchecked Sendable {
         lifecycle.cancel()
         lock.lock(); token.cancel(); watcherToken.cancel(); lock.unlock()
         watcherQueue.async { [weak self] in self?.watcher?.stop() }
+        eventsQueue.async { [weak self] in
+            self?.eventWork?.cancel(); self?.eventWork = nil
+            self?.pendingEvents.removeAll(keepingCapacity: false)
+            self?.pendingCalibrations.removeAll(keepingCapacity: false)
+        }
         let cleanup = {
             self.timer?.cancel(); self.persistenceTimer?.cancel()
             self.observers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }

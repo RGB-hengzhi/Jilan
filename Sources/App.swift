@@ -91,7 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func about(_ sender: Any?) {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "疾览 · Jilan",
-            .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.2.1",
+            .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.2.2",
             .version: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1",
             .credits: NSAttributedString(string: "by 塔贰舅\n\n全盘即时搜索与双栏文件管理\n\n搜索索引保存在这台 Mac 上。\n移植并改造 Cling 的 SIMD 与独立索引核心。\n开源声明和许可证见「开源声明」。"),
             NSApplication.AboutPanelOptionKey(rawValue: "Copyright"): "© 2026 塔贰舅 · GPL-3.0 开源许可"
