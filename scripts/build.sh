@@ -2,7 +2,7 @@
 set -euo pipefail
 export COPYFILE_DISABLE=1
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD_DIR="${QUICKFIND_BUILD_DIR:-$HOME/Library/Caches/Jilan-dev/build}"
+BUILD_DIR="${QUICKFIND_BUILD_DIR:-$HOME/Library/Caches/QuickFind-dev/build}"
 DELIVERY_APP="$PROJECT_DIR/交付/疾览.app"
 APP_DIR="$BUILD_DIR/package/疾览.app"
 mkdir -p "$BUILD_DIR" "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources/docs"
@@ -28,8 +28,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>cn.local.quickfind</string>
 <key>CFBundleExecutable</key><string>QuickFind</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>2.2.1</string>
-<key>CFBundleVersion</key><string>8</string>
+<key>CFBundleShortVersionString</key><string>2.2.2</string>
+<key>CFBundleVersion</key><string>9</string>
 <key>CFBundleDevelopmentRegion</key><string>zh-Hans</string>
 <key>CFBundleLocalizations</key><array><string>zh-Hans</string></array>
 <key>CFBundleIconFile</key><string>QuickFind</string>
