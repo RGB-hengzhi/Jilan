@@ -94,7 +94,9 @@ enum WorkspaceFilesystemTests {
     private static func browse(_ directory: URL, hidden: Bool) throws -> [DirectoryEntry] {
         var result: Result<[DirectoryEntry], Error>?
         var onMain = false
-        DirectoryBrowser().load(path: directory.path, showHidden: hidden) {
+        let browser = DirectoryBrowser()
+        defer { withExtendedLifetime(browser) {} }
+        browser.load(path: directory.path, showHidden: hidden) {
             onMain = Thread.isMainThread; result = $0
         }
         let deadline = Date().addingTimeInterval(10)

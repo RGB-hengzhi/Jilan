@@ -48,11 +48,63 @@ enum ScanWorkerTests {
         try check(calls == savedCalls, "取消返回之后不能迟到回调")
         var timeoutOptions = options(0.35); timeoutOptions.stallOnceAtPath = blocked.path
         var retryEntries: [String: Bool] = [:]
+        let retryIndex = EngineIndex()
         let retry = ScanWorker.scan(path: fixture.path, excludedPrefixes: [], cancelled: { false },
-            onEntry: { retryEntries[$0] = $1 }, onProgress: { _, _ in }, options: timeoutOptions)
+            onEntry: { retryEntries[$0] = $1 }, onProgress: { _, _ in },
+            indexEntry: { path, directory in
+                (retryIndex.add(path: path, isDirectory: directory), retryIndex.count)
+            }, options: timeoutOptions)
         try check(retry.completed && retry.totalIssueCount == 1 && retry.issues.count == 1
                     && retry.issues[0].path == blocked.path && retryEntries[healthy.path] == false
                     && retryEntries[cached.path] == nil && retry.count == retryEntries.count, "超时后必须精确标记受限子树并继续其它目录，重试条目不得重复")
+        // Legacy callbacks have no index ledger. A timeout returns incomplete
+        // after one pass rather than allocating a full duplicate path table.
+        let genericPidStart = pids.count
+        let genericTimeout = ScanWorker.scan(path: fixture.path, excludedPrefixes: [], cancelled: { false },
+            onEntry: { _, _ in }, onProgress: { _, _ in }, options: timeoutOptions)
+        try check(!genericTimeout.completed && pids.count == genericPidStart + 1,
+                  "无host ledger的超时不得重放条目或另建全路径缓存")
+
+        var hostedCancel = false, hostedCalls = 0
+        let cancelIndex = EngineIndex()
+        let hosted = ScanWorker.scan(path: fixture.path, excludedPrefixes: [], cancelled: { hostedCancel },
+            onEntry: { _, _ in hostedCalls += 1; if hostedCalls == 3 { hostedCancel = true } }, onProgress: { _, _ in },
+            indexEntry: { path, directory in (cancelIndex.add(path: path, isDirectory: directory), cancelIndex.count) },
+            options: options())
+        try check(!hosted.completed && hosted.count == 3 && hostedCalls == 3 && cancelIndex.count == 3,
+                  "host索引去重仍须第三条取消且计数精确")
+
+        // At the stalled child's intent, replace the already indexed root with
+        // a regular file. The retry must observe the new type and remove every
+        // previously staged descendant, without opening that file's contents.
+        let changing = fixture.appendingPathComponent("类型变化根"), changingParked = changing.appendingPathComponent("停住子目录")
+        let displaced = fixture.appendingPathComponent("类型变化旧目录")
+        try fm.createDirectory(at: changingParked, withIntermediateDirectories: true)
+        try Data().write(to: changingParked.appendingPathComponent("曾存在的子项.txt"))
+        let changeIndex = EngineIndex()
+        var changedType = false, mutationFailed = false, typeCallbacks: [Bool] = []
+        var changeOptions = options(0.2); changeOptions.stallOnceAtPath = changingParked.path
+        let changed = ScanWorker.scan(path: changing.path, excludedPrefixes: [], cancelled: { false },
+            onEntry: { path, directory in if path == changing.path { typeCallbacks.append(directory) } }, onProgress: { _, _ in },
+            onIOIntent: { path in
+                guard path == changingParked.path, !changedType else { return }
+                do {
+                    try fm.moveItem(at: changing, to: displaced)
+                    try Data("owned replacement file".utf8).write(to: changing)
+                    changedType = true
+                } catch { mutationFailed = true }
+            }, indexEntry: { path, directory in
+                if !directory && changeIndex.pathIsDirectory(path) == true { changeIndex.removeSubtree(path: path) }
+                return (changeIndex.add(path: path, isDirectory: directory), changeIndex.count)
+            }, options: changeOptions)
+        var replacementStat = stat()
+        let replacementIsFile = lstat(changing.path, &replacementStat) == 0
+            && replacementStat.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG)
+        let exactChangePaths = Set(changeIndex.query(SearchRequest(query: ""), rootID: "owned", limit: 20).hits.map(\.path))
+        try check(!mutationFailed && changedType && replacementIsFile && changed.completed && changed.count == 1
+                    && exactChangePaths == [changing.path] && changeIndex.pathIsDirectory(changing.path) == false
+                    && typeCallbacks == [true, false], "重试目录转文件须清除staged子树、报告实际一个节点且类型变更只通知一次")
+
         var noRetryOptions = options(0.15); noRetryOptions.stallOnceAtPath = blocked.path; noRetryOptions.maximumTimeoutRetries = 0
         let noRetry = ScanWorker.scan(path: fixture.path, excludedPrefixes: [], cancelled: { false },
             onEntry: { _, _ in }, onProgress: { _, _ in }, options: noRetryOptions)
@@ -80,7 +132,8 @@ enum ScanWorkerTests {
         return ["status": "passed", "streamedFixtureEntries": normal.count,
             "batchBoundaryCancellationCount": cancelled.count, "parkedIOCancellationSeconds": cancellationSeconds,
             "timeoutRetryContinuesOtherDirectories": true, "timeoutIssueRetainsExactSubtree": true,
-            "retryBudgetIsBounded": true, "crashAndMalformedFramesRejected": true,
+            "retryBudgetIsBounded": true, "genericTimeoutIsSinglePass": true,
+            "hostedCancellationKeepsExactCount": true, "retryDirectoryToFileClearsStagedDescendants": true, "crashAndMalformedFramesRejected": true,
             "spawnedChildrenReaped": pids.count, "emptyPathDoesNotScanCWD": true]
     }
     private static func check(_ condition: @autoclosure () -> Bool, _ message: String) throws {

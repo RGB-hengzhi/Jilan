@@ -231,6 +231,128 @@ enum EngineTests {
                   sparseLoaded.query(SearchRequest(query: "新增É"), rootID: "sparse", limit: 100).totalMatches == 1,
                   "带空槽及乱序复用的索引保存须保持路径、类型、Unicode并正确重算紧凑字节偏移")
 
+
+        // Index acceptance replaces ScanWorker's second full-path dictionary.
+        let acceptance = EngineIndex()
+        try check(acceptance.add(path: "/接收/é.txt", isDirectory: false), "新路径应报告新增")
+        try check(!acceptance.add(path: "/接收/e\u{0301}.txt", isDirectory: false) && acceptance.count == 1,
+                  "Unicode等价路径的重复接收不能增加数量")
+        try check(acceptance.add(path: "/接收/e\u{0301}.txt", isDirectory: true) && acceptance.count == 1 &&
+                  acceptance.pathIsDirectory("/接收/é.txt") == true && acceptance.pathIsDirectory("/接收/missing") == nil,
+                  "类型变化应报告改变但不能增加数量")
+
+        // Deliberately force all original paths into one hash bucket. Matching,
+        // deletion of head/middle/tail, slot reuse, compaction and snapshots must
+        // verify original paths rather than trust the hash value.
+        let colliding = SearchEngine(pathHashBits: 0)
+        for number in 0..<24 { colliding.addPath("/碰撞/组\(number % 3)/文件\(number).txt", isDir: number == 7) }
+        colliding.addPath("/碰撞/é.txt", isDir: false)
+        colliding.addPath("/碰撞/e\u{0301}.txt", isDir: false)
+        try check(colliding.count == 25 && colliding.hasPath("/碰撞/e\u{0301}.txt") && !colliding.hasPath("/碰撞/missing.txt"),
+                  "强制哈希碰撞仍需按Unicode等价原路径验证")
+        let collisionCursor = colliding.makeQueryCursor(SearchRequest(query: ""), rootID: "collision")
+        for number in [0, 12, 23] { colliding.removeSubtree("/碰撞/组\(number % 3)/文件\(number).txt") }
+        colliding.removeSubtree("/碰撞/组1")
+        colliding.addPath("/碰撞/复用.txt", isDir: false)
+        try check(colliding.count == 15 && colliding.hasPath("/碰撞/复用.txt") && !colliding.hasPath("/碰撞/组0/文件0.txt") &&
+                  colliding.literalQuery(SearchRequest(query: ""), rootID: "collision", limit: 0).totalMatches == 15,
+                  "碰撞链删除、空槽复用及压缩不能丢失其他路径")
+        try check(collisionCursor.hasPath("/碰撞/组0/文件0.txt") && !collisionCursor.hasPath("/碰撞/复用.txt") &&
+                  collisionCursor.countCandidates() == 25, "碰撞成员查询必须使用游标的原始快照")
+
+        let boundary = EngineIndex()
+        for item in ["/父目录/e\u{0301}cole/报告é.txt", "/父目录/e\u{0301}cole/other.txt", "/兄弟/école报告é.txt", "/"] {
+            boundary.add(path: item, isDirectory: item == "/")
+        }
+        try check(boundary.query(SearchRequest(query: "cole/报告É", matchPath: true), rootID: "boundary", limit: 10).totalMatches == 1,
+                  "路径字节搜索必须跨共享parent和basename边界且保持Unicode等价")
+        try check(boundary.query(SearchRequest(query: "cole/报告É"), rootID: "boundary", limit: 10).totalMatches == 0,
+                  "名称搜索不能意外包含共享父目录")
+        try check(boundary.query(SearchRequest(query: "*cole/报告?.txt", matchPath: true), rootID: "boundary", limit: 10).totalMatches == 1 &&
+                  boundary.query(SearchRequest(query: "/", kind: .folders), rootID: "boundary", limit: 10).totalMatches == 1,
+                  "跨parent字符通配和根目录名称语义必须保持")
+
+        let graphemes = EngineIndex()
+        let graphemeNames = ["q\u{0301}资料.txt", "🇨🇳.txt", "👩‍💻.txt", "\u{0600}.pdf", "中文.pdf", "plain.pdf"]
+        for name in graphemeNames { graphemes.add(path: "/字素/" + name, isDirectory: false) }
+        for pattern in ["q*", "*q*", "🇨*", "*🇨*", "👩*", "*💻*", "*.pdf", "?资料.txt", "*资料*", "*"] {
+            let expected = Set(graphemeNames.filter { AdvancedSearchPlan.wildcardMatches(AdvancedSearchPlan.normalize(pattern), text: AdvancedSearchPlan.normalize($0)) })
+            let actual = graphemes.query(SearchRequest(query: pattern), rootID: "grapheme", limit: 100)
+            try check(Set(actual.hits.map(\.name)) == expected && actual.totalMatches == expected.count,
+                      "通配字节快路必须遵守combining/regional/ZWJ/Prepend字素边界：" + pattern)
+        }
+        try check(graphemes.query(SearchRequest(query: "q"), rootID: "grapheme", limit: 100).totalMatches == 1,
+                  "非通配连续片段保留原字节检索语义")
+
+        let chunked = EngineIndex()
+        for number in 0..<4_137 { chunked.add(path: "/分块/父/报告_\(number).pdf", isDirectory: number % 71 == 0) }
+        var scoped = SearchFilters(); scoped.includedPaths = ["/分块/父"]
+        let cursorRequests = [SearchRequest(query: "报告"), SearchRequest(query: "报告", kind: .files),
+                              SearchRequest(query: "*.pdf | 不存在 !报告"), SearchRequest(query: "(报告 | 缺失) !不存在"),
+                              SearchRequest(query: "父/报", matchPath: true), SearchRequest(query: "", filters: scoped)]
+        for request in cursorRequests {
+            let expected = chunked.query(request, rootID: "chunk", limit: 10_000)
+            let cursor = chunked.makeQueryCursor(request, rootID: "chunk")
+            try check(cursor.countCandidates() == expected.totalMatches && cursor.scannedEntries == 0,
+                      "候选计数不能推进游标或改变同快照命中总数")
+            var actual: [FileHit] = [], batches = 0
+            while !cursor.isComplete {
+                let values = cursor.next(maximum: 50_000)
+                try check(values.count <= 2000, "游标必须硬性限制每批命中数")
+                actual.append(contentsOf: values); batches += 1
+                try check(batches < 8, "游标必须持续推进直至完成")
+            }
+            try check(actual == expected.hits && cursor.countCandidates() == expected.totalMatches && cursor.next().isEmpty,
+                      "全部游标块必须与一次query顺序、类型、路径及数量完全相同")
+        }
+        let versioned = chunked.makeQueryCursor(SearchRequest(query: ""), rootID: "chunk", excludeHit: { path in
+            // Exclusions may safely re-enter the same engine, without locks.
+            _ = chunked.pathIsDirectory(path)
+            return path.hasSuffix("_3.pdf")
+        })
+        let versionedCount = versioned.countCandidates()
+        chunked.removeSubtree(path: "/分块/父/报告_3.pdf")
+        chunked.add(path: "/分块/父/新加.pdf", isDirectory: false)
+        var versionedHits: [FileHit] = []
+        while !versioned.isComplete { versionedHits.append(contentsOf: versioned.next(maximum: 137)) }
+        try check(versionedCount == 4_136 && versionedHits.count == 4_136 &&
+                  versioned.hasPath("/分块/父/报告_3.pdf") && !versioned.hasPath("/分块/父/新加.pdf"),
+                  "分块读取及成员判断不能混入创建游标之后的增删")
+        let cursorCancellation = CancellationFlag()
+        let cancelledCursor = chunked.makeQueryCursor(SearchRequest(query: "", cancellation: cursorCancellation), rootID: "chunk")
+        try check(cancelledCursor.next(maximum: 17).count == 17, "游标应按请求的小批量上限返回")
+        cursorCancellation.cancel()
+        try check(cancelledCursor.isComplete && cancelledCursor.next().isEmpty && cancelledCursor.countCandidates() == 0,
+                  "取消后游标不能再产生条目或继续候选计数")
+
+        // Resolving scopes happens once per query version. Changing an owned
+        // alias after capture must not make countCandidates reparse a new scope.
+        let scopeA = temporary.appendingPathComponent("scope-a", isDirectory: true)
+        let scopeB = temporary.appendingPathComponent("scope-b", isDirectory: true)
+        let scopeAlias = temporary.appendingPathComponent("scope-alias", isDirectory: true)
+        try FileManager.default.createDirectory(at: scopeA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: scopeB, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: scopeAlias, withDestinationURL: scopeA)
+        let scopedIndex = EngineIndex()
+        scopedIndex.add(path: SearchFilters.canonicalScopePath(scopeA.path) + "/first.txt", isDirectory: false)
+        scopedIndex.add(path: SearchFilters.canonicalScopePath(scopeB.path) + "/second.txt", isDirectory: false)
+        var aliasFilters = SearchFilters(); aliasFilters.includedPaths = [scopeAlias.path]
+        let scopedCursor = scopedIndex.makeQueryCursor(SearchRequest(query: "", filters: aliasFilters), rootID: "alias")
+        try FileManager.default.removeItem(at: scopeAlias)
+        try FileManager.default.createSymbolicLink(at: scopeAlias, withDestinationURL: scopeB)
+        try check(scopedCursor.countCandidates() == 1 && scopedCursor.next().map(\.name) == ["first.txt"],
+                  "游标计数必须保持创建时解析的目录范围，不能重新解析已改变的别名")
+
+        // A valid checksum cannot make overlapping/gapped normalized offsets
+        // acceptable. v1 strict validation is kept for rollback compatibility.
+        try index.save(to: savedURL)
+        var overlap = try Data(contentsOf: savedURL).dropLast(32)
+        for byte in 0..<8 { overlap[offsetArrayStart + 8 + byte] = 0 }
+        overlap.append(contentsOf: SHA256.hash(data: overlap))
+        try overlap.write(to: damagedURL)
+        do { _ = try EngineIndex.load(from: damagedURL); throw EngineTestError.failed("有效校验和的重叠字节索引被接受") }
+        catch is IndexPersistenceError { }
+
         let benchmark = SearchEngine()
         let numberOfEntries = 1_000_000
         benchmark.reserveCapacity(numberOfEntries)
@@ -263,6 +385,8 @@ enum EngineTests {
                   "百万条索引二进制往返应保持数据及查询")
         return ["functionalChecks": "passed", "corruptFilesRejected": corruptions.count,
                 "snapshotEnumerationConcurrency": "passed",
+                "compactHashCollisionAndUnicode": "passed", "boundedQueryCursor": "passed",
+                "sharedPrefixBoundary": "passed", "graphemeWildcardEquivalence": "passed",
                 "syntheticEntries": numberOfEntries, "indexBuildMilliseconds": indexingMilliseconds,
                 "binaryFileBytes": largeFileSize, "binarySaveMilliseconds": saveMilliseconds,
                 "binaryLoadMilliseconds": loadMilliseconds,
