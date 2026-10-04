@@ -28,8 +28,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>cn.local.quickfind</string>
 <key>CFBundleExecutable</key><string>QuickFind</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>2.2.2</string>
-<key>CFBundleVersion</key><string>9</string>
+<key>CFBundleShortVersionString</key><string>2.2.3</string>
+<key>CFBundleVersion</key><string>10</string>
 <key>CFBundleDevelopmentRegion</key><string>zh-Hans</string>
 <key>CFBundleLocalizations</key><array><string>zh-Hans</string></array>
 <key>CFBundleIconFile</key><string>QuickFind</string>
