@@ -1,5 +1,28 @@
 import AppKit
 import Quartz
+import Darwin
+
+enum PreviewMetadataScope {
+    static func shouldRefresh(path: String, physicalPath: String?, changedPaths: [String]?) -> Bool {
+        guard let changedPaths else { return true }
+        let changed = Set(changedPaths)
+        guard !changed.isEmpty else { return false }
+        if MetadataPathScope.contains(path, changedPaths: changed) { return true }
+        // The initial background read may not have resolved a symlink/alias
+        // yet. Conservatively inspect the one selected item in that interval.
+        guard let physicalPath else { return true }
+        return MetadataPathScope.contains(physicalPath, changedPaths: changed)
+    }
+
+    /// Filesystem resolution belongs on the existing preview utility queue.
+    static func resolvePhysicalPath(_ path: String) -> String? {
+        path.withCString { pointer in
+            guard let resolved = realpath(pointer, nil) else { return nil }
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
+    }
+}
 
 /// A native workspace beside the global index. Its directory reads and file jobs
 /// never run on the index's query queue.
@@ -44,6 +67,7 @@ final class WorkspaceController: NSViewController {
     private var currentPreviewKey: String?
     private var visibilityKey: String?
     private var currentPreviewPath: String?
+    private var currentPreviewPhysicalPath: String?
     private var previewGeneration = 0
     private struct PreviewStamp: Equatable {
         var size: Int64?
@@ -289,7 +313,7 @@ final class WorkspaceController: NSViewController {
         let key = String(previewVisible) + "\u{0000}" + (path ?? "")
         guard currentPreviewKey != key else { return }
         currentPreviewKey = key
-        currentPreviewPath = path; previewStamp = nil
+        currentPreviewPath = path; currentPreviewPhysicalPath = nil; previewStamp = nil
         previewGeneration += 1
         guard let path else {
             quickLook?.previewItem = nil; previewName.stringValue = "选择文件以预览"; previewInfo.stringValue = ""; return
@@ -302,8 +326,10 @@ final class WorkspaceController: NSViewController {
 
     /// A real index change may refer to this file being edited in another app.
     /// Check its identity/attributes without restarting an unchanged preview.
-    func refreshSelectedPreview() {
+    func refreshSelectedPreview(changedPaths: [String]? = nil) {
         guard let path = currentPreviewPath else { return }
+        guard PreviewMetadataScope.shouldRefresh(path: path, physicalPath: currentPreviewPhysicalPath,
+                                                changedPaths: changedPaths) else { return }
         readPreviewMetadata(path: path, reloadIfChanged: true)
     }
 
@@ -311,6 +337,7 @@ final class WorkspaceController: NSViewController {
         let requestedPath = path
         previewGeneration += 1; let generation = previewGeneration
         DispatchQueue.global(qos: .utility).async { [weak self] in
+            let physicalPath = PreviewMetadataScope.resolvePhysicalPath(requestedPath)
             let attributes = try? FileManager.default.attributesOfItem(atPath: requestedPath)
             let stamp = PreviewStamp(size: (attributes?[.size] as? NSNumber)?.int64Value,
                 modified: attributes?[.modificationDate] as? Date, created: attributes?[.creationDate] as? Date,
@@ -319,6 +346,7 @@ final class WorkspaceController: NSViewController {
                 type: (attributes?[.type] as? FileAttributeType)?.rawValue)
             DispatchQueue.main.async {
                 guard let self, self.previewGeneration == generation, self.currentPreviewPath == requestedPath else { return }
+                self.currentPreviewPhysicalPath = physicalPath
                 if reloadIfChanged && self.previewStamp != stamp && self.previewVisible {
                     self.quickLook?.previewItem = nil
                     self.quickLook?.previewItem = NSURL(fileURLWithPath: requestedPath)

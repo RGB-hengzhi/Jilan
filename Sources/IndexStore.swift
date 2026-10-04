@@ -18,6 +18,10 @@ struct StoreSnapshot {
     var scannedCount: Int
     var issues: [ScanIssue]
     var message: String
+    /// Content/attribute hints invalidate metadata independently of the name
+    /// index. nil means the path budget was exceeded and all metadata is stale.
+    var metadataRevision: UInt64 = 0
+    var changedMetadataPaths: [String]? = nil
 }
 
 private struct RootMetadata: Codable {
@@ -42,6 +46,9 @@ final class IndexStore: @unchecked Sendable {
     // Progress and watcher notices do not change searchable data. Advance this
     // only when a published engine, root set or online status changes.
     private var searchRevision: UInt64 = 0
+    private var metadataRevision: UInt64 = 0
+    private var changedMetadataPaths: [String]? = nil
+    static let maximumChangedMetadataPaths = 2000
     private var message = "正在载入本地索引…"
     private var token = CancellationFlag()
     private var watcher: FileWatcher?
@@ -167,7 +174,8 @@ final class IndexStore: @unchecked Sendable {
     func snapshot() -> StoreSnapshot {
         lock.lock(); defer { lock.unlock() }
         return StoreSnapshot(searchRevision: searchRevision, roots: records.compactMap { statuses[$0.id] }, isScanning: scanning,
-            scannedCount: progressCount, issues: records.flatMap { rootIssues[$0.id] ?? [] } + (rootIssues["watcher"] ?? []), message: message)
+            scannedCount: progressCount, issues: records.flatMap { rootIssues[$0.id] ?? [] } + (rootIssues["watcher"] ?? []), message: message,
+            metadataRevision: metadataRevision, changedMetadataPaths: changedMetadataPaths)
     }
 
     private func publish() { onUpdate?(snapshot()) }
@@ -563,7 +571,8 @@ final class IndexStore: @unchecked Sendable {
                 let previous = self.pendingEvents[change.path]
                 self.pendingEvents[change.path] = FileChange(path: change.path,
                     flags: (previous?.flags ?? 0) | change.flags,
-                    requiresFullScan: previous?.requiresFullScan == true || change.requiresFullScan)
+                    requiresFullScan: previous?.requiresFullScan == true || change.requiresFullScan,
+                    hasUnclassifiedHint: previous?.hasUnclassifiedHint == true || change.hasUnclassifiedHint)
                 if self.pendingEvents.count > Self.maximumPendingEventPaths {
                     // Promote only roots touched by this pending batch. The
                     // path dictionary is released before subsequent events.
@@ -627,7 +636,15 @@ final class IndexStore: @unchecked Sendable {
         guard !stopped else { return }
         lock.lock(); let currentRecords = records; lock.unlock()
         var fullRoots = Set<String>(), changedRoots = Set<String>()
-        var requests: [String: Set<String>] = [:]
+        var requests: [String: [String: FileChange]] = [:]
+        var metadataPaths = Set<String>(), allMetadataChanged = false
+        func markMetadataChanged(at path: String) {
+            guard !allMetadataChanged else { return }
+            metadataPaths.insert(path)
+            if metadataPaths.count > Self.maximumChangedMetadataPaths {
+                metadataPaths.removeAll(keepingCapacity: false); allMetadataChanged = true
+            }
+        }
         for change in changes {
             let globalLoss = UInt32(kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagEventIdsWrapped)
             if change.flags & globalLoss != 0 {
@@ -642,7 +659,11 @@ final class IndexStore: @unchecked Sendable {
             for record in currentRecords where change.path == record.path || change.path.hasPrefix(record.path == "/" ? "/" : record.path + "/") {
                 if exclusions(for: record).contains(where: { change.path == $0 || change.path.hasPrefix($0 + "/") }) { continue }
                 if change.requiresFullScan { fullRoots.insert(record.id); continue }
-                requests[record.id, default: []].insert(change.path)
+                let previous = requests[record.id]?[change.path]
+                requests[record.id, default: [:]][change.path] = FileChange(path: change.path,
+                    flags: (previous?.flags ?? 0) | change.flags,
+                    requiresFullScan: previous?.requiresFullScan == true || change.requiresFullScan,
+                    hasUnclassifiedHint: previous?.hasUnclassifiedHint == true || change.hasUnclassifiedHint)
             }
         }
         lock.lock()
@@ -659,12 +680,19 @@ final class IndexStore: @unchecked Sendable {
             guard let paths = requests[record.id], !paths.isEmpty else { continue }
             lock.lock(); let engine = engines[record.id]; lock.unlock()
             guard let engine else { continue }
-            let minimal = paths.filter { path in !paths.contains { other in other != path && path.hasPrefix(other + "/") } }
+            // A directory's chmod/xattr hint cannot subsume a child's creation
+            // or rename: its fast path intentionally does not enumerate children.
+            let minimal = paths.keys.filter { path in
+                !paths.contains { other, hint in
+                    other != path && !hint.isMetadataOnly && Self.path(other, contains: path)
+                }
+            }
             var indexChanged = false
             var metadataChanged = false
             var rootInterrupted = false
             for path in minimal {
                 if stopped || incrementalToken.isCancelled { rootInterrupted = true; break }
+                let change = paths[path]!
                 var attributes = stat()
                 if lstat(path, &attributes) == 0 {
                     // An old-case path still resolves after a case-only rename
@@ -677,6 +705,16 @@ final class IndexStore: @unchecked Sendable {
                         let name = (try? url.resourceValues(forKeys: [.nameKey]))?.name ?? url.lastPathComponent
                         currentPath = (Self.actualSpelling(of: url.deletingLastPathComponent().path) as NSString).appendingPathComponent(name)
                     } else { currentPath = Self.actualSpelling(of: path) }
+                    let isDirectory = attributes.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR)
+                    let previousType = engine.pathIsDirectory(path)
+                    let directoryContentHint = isDirectory
+                        && change.flags & UInt32(kFSEventStreamEventFlagItemModified) != 0
+                    if change.isMetadataOnly && !directoryContentHint && currentPath == path && previousType == isDirectory {
+                        // The name and node type are unchanged. Notify metadata
+                        // consumers without rebuilding names or rewriting qfi.
+                        markMetadataChanged(at: currentPath)
+                        continue
+                    }
                     if attributes.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) {
                         let staged = EngineIndex()
                         let report = FileScanner.scan(path: currentPath, excludedPrefixes: exclusions(for: record),
@@ -719,24 +757,37 @@ final class IndexStore: @unchecked Sendable {
                         lock.unlock()
                         metadataChanged = true
                     } else {
-                        engine.removeSubtree(path: path)
+                        var changed = false
+                        if previousType != false || currentPath != path {
+                            changed = engine.removeSubtree(path: path)
+                        }
+                        if currentPath != path && engine.pathIsDirectory(currentPath) != false {
+                            changed = engine.removeSubtree(path: currentPath) || changed
+                        }
                         // lstat preserves even dangling symbolic links as searchable entries.
-                        engine.add(path: currentPath, isDirectory: false)
-                        indexChanged = true
+                        changed = engine.add(path: currentPath, isDirectory: false) || changed
+                        indexChanged = indexChanged || changed
+                        if !changed { markMetadataChanged(at: currentPath) }
                     }
                 } else {
                     let code = errno
-                    if code == ENOENT || code == ENOTDIR { engine.removeSubtree(path: path); indexChanged = true }
+                    if code == ENOENT || code == ENOTDIR {
+                        // A partial/retained cache can contain descendants even
+                        // when their exact ancestor is absent. File/mixed flags
+                        // are hints and must not leave that old subtree behind.
+                        indexChanged = engine.removeSubtree(path: path) || indexChanged
+                    }
                     else {
                         let issue = ScanIssue(path: path, message: "实时更新无法访问（\(code)），保留旧索引：\(String(cString: strerror(code)))；请重新扫描校准。")
                         lock.lock()
                         var existing = rootIssues[record.id] ?? []
-                        if !existing.contains(where: { $0.id == issue.id }) { existing.append(issue) }
+                        let newIssue = !existing.contains(where: { $0.id == issue.id })
+                        if newIssue { existing.append(issue) }
                         rootIssues[record.id] = Array(existing.prefix(1000))
                         statuses[record.id]?.issueCount = existing.count
                         statuses[record.id]?.state = "实时更新访问受限（保留旧索引）"
                         lock.unlock()
-                        metadataChanged = true
+                        metadataChanged = metadataChanged || newIssue
                         rootInterrupted = true
                     }
                 }
@@ -755,6 +806,11 @@ final class IndexStore: @unchecked Sendable {
             lock.unlock()
             if indexChanged { changedRoots.insert(record.id) }
             if rootInterrupted { interrupted = true }
+        }
+        if allMetadataChanged || !metadataPaths.isEmpty {
+            lock.lock(); metadataRevision &+= 1
+            changedMetadataPaths = allMetadataChanged ? nil : metadataPaths.sorted()
+            lock.unlock()
         }
         if interrupted { setMessage("部分实时更新未完成，旧索引及问题记录已保留。请重新扫描校准。") }
         else if !changedRoots.isEmpty { setMessage("文件变化已更新。离线磁盘显示上次索引。") }

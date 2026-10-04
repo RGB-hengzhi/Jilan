@@ -5,13 +5,16 @@ import Darwin
 enum Diagnostic {
     static func run(arguments: [String]) -> Int32 {
         do {
-            var report: [String: Any] = ["application": Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "疾览 · Jilan", "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.2.2", "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
+            var report: [String: Any] = ["application": Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "疾览 · Jilan", "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.2.3", "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
                 "testedAt": ISO8601DateFormatter().string(from: Date()),
                 "architecture": "arm64", "os": ProcessInfo.processInfo.operatingSystemVersionString]
             if arguments.contains("--self-test") || arguments.contains("--benchmark") {
                 report["engine"] = try EngineTests.run()
             }
             if arguments.contains("--self-test") {
+                report["subtreeUpdates"] = try SubtreeUpdateTests.run()
+                report["eventEnergy"] = try EventEnergyTests.run()
+                report["metadataEvents"] = try MainActor.assumeIsolated { try MetadataEventRefreshTests.run() }
                 report["pathCoverage"] = try PathCoverageTests.run()
                 report["advancedSearch"] = try AdvancedSearchTests.run()
                 report["filterUpgrade"] = try FilterUpgradeTests.run()

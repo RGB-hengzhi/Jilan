@@ -6,6 +6,24 @@ struct FileChange {
     let path: String
     let flags: UInt32
     let requiresFullScan: Bool
+    let hasUnclassifiedHint: Bool
+
+    init(path: String, flags: UInt32, requiresFullScan: Bool, hasUnclassifiedHint: Bool = false) {
+        self.path = path; self.flags = flags; self.requiresFullScan = requiresFullScan
+        self.hasUnclassifiedHint = hasUnclassifiedHint || flags == 0
+    }
+
+    /// FileEvents describes content/attribute writes separately from changes to
+    /// the name tree. Mixed/coalesced hints and flagless operation hints retain
+    /// their conservative structural handling.
+    var isMetadataOnly: Bool {
+        let metadata = UInt32(kFSEventStreamEventFlagItemModified
+            | kFSEventStreamEventFlagItemInodeMetaMod | kFSEventStreamEventFlagItemFinderInfoMod
+            | kFSEventStreamEventFlagItemChangeOwner | kFSEventStreamEventFlagItemXattrMod)
+        let structural = UInt32(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemRemoved
+            | kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemCloned)
+        return !requiresFullScan && !hasUnclassifiedHint && flags & metadata != 0 && flags & structural == 0
+    }
 }
 
 /// FSEvents is a change hint, not a complete durable change journal. A startup

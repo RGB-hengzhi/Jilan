@@ -295,24 +295,71 @@ final class SearchEngine: @unchecked Sendable {
     func addIfChanged(_ path: String, isDir: Bool) -> Bool {
         lock.withLock { addUnlocked(Self.trimTrailingSlash(path), isDir: isDir).changed }
     }
-    func removeSubtree(_ path: String) {
+    @discardableResult
+    func removeSubtree(_ path: String) -> Bool {
         let root = Self.trimTrailingSlash(path)
-        guard !root.isEmpty else { return }
+        guard !root.isEmpty else { return false }
         let prefix = root == "/" ? "/" : root + "/"
-        lock.withLock {
-            if let id = findPathUnlocked(root), !entries[id].isDir {
+        return lock.withLock {
+            let rootID = findPathUnlocked(root)
+            if let id = rootID, !entries[id].isDir {
                 removeIDUnlocked(id, hash: hashPath(root))
                 if entries.count > 1024, free.count > entries.count / 3 { compactUnlocked() }
-                return
+                return true
             }
-            // Removal is intentionally in-memory; no path resolution or I/O.
-            for id in entries.indices where entries[id].isLive {
-                let candidate = pathUnlocked(entries[id])
-                if candidate == root || candidate.hasPrefix(prefix) {
-                    removeIDUnlocked(id, hash: hashPath(candidate))
+            // Each parent prefix is shared by many entries. Check the parent
+            // table once, rather than allocating a full path for every file on
+            // every directory/unknown-path event. String.hasPrefix preserves
+            // the existing canonical Unicode semantics and slash boundary.
+            var affectedParents = Set<UInt32>()
+            let prefixBytes = Array(prefix.utf8)
+            if prefixBytes.allSatisfy({ $0 < 0x80 }) {
+                // Most unrelated parents differ at an ASCII byte. Those need
+                // no String allocation. A non-ASCII mismatch still uses Swift
+                // equality: e.g. the Kelvin sign is canonically equal to K.
+                originalBytes.withUnsafeBufferPointer { arena in
+                    prefixBytes.withUnsafeBufferPointer { wanted in
+                        for id in parents.indices where parents[id].references > 0 {
+                            let parent = parents[id]
+                            let start = Int(parent.originalOffset), length = Int(parent.originalLength)
+                            let bytes = arena.baseAddress! + start
+                            let exact = length >= wanted.count && memcmp(bytes, wanted.baseAddress!, wanted.count) == 0
+                            var checkUnicode = exact && length > wanted.count && bytes[wanted.count] >= 0x80
+                            if !exact {
+                                for offset in 0..<min(length, wanted.count) where bytes[offset] != wanted[offset] {
+                                    checkUnicode = bytes[offset] >= 0x80; break
+                                }
+                            }
+                            let matches = checkUnicode
+                                ? String(decoding: UnsafeBufferPointer(start: bytes, count: length), as: UTF8.self).hasPrefix(prefix)
+                                : exact
+                            if matches {
+                                affectedParents.insert(UInt32(id))
+                            }
+                        }
+                    }
+                }
+            } else {
+                for id in parents.indices where parents[id].references > 0 {
+                    let parent = parents[id]
+                    let start = Int(parent.originalOffset), length = Int(parent.originalLength)
+                    let value = String(decoding: originalBytes[start..<(start + length)], as: UTF8.self)
+                    if value.hasPrefix(prefix) { affectedParents.insert(UInt32(id)) }
                 }
             }
-            if !entries.isEmpty, free.count > entries.count / 3 { compactUnlocked() }
+            guard rootID != nil || !affectedParents.isEmpty else { return false }
+            var removed = false
+            if let id = rootID {
+                removeIDUnlocked(id, hash: hashPath(root)); removed = true
+            }
+            if !affectedParents.isEmpty {
+                for id in entries.indices where entries[id].isLive && affectedParents.contains(entries[id].parent) {
+                    let candidate = pathUnlocked(entries[id])
+                    removeIDUnlocked(id, hash: hashPath(candidate)); removed = true
+                }
+            }
+            if removed, !entries.isEmpty, free.count > entries.count / 3 { compactUnlocked() }
+            return removed
         }
     }
 

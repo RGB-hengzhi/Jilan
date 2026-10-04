@@ -24,7 +24,8 @@ final class EngineIndex: @unchecked Sendable {
                          excludeHit: ((String) -> Bool)? = nil) -> SearchEngine.QueryCursor {
         engine.makeQueryCursor(request, rootID: rootID, excludeHit: excludeHit)
     }
-    func removeSubtree(path: String) { engine.removeSubtree(path) }
+    @discardableResult
+    func removeSubtree(path: String) -> Bool { engine.removeSubtree(path) }
     /// Queries use a captured compact snapshot; exclusion callbacks are unlocked
     /// and may re-enter this index. Use cursor membership for version consistency.
     func query(_ request: SearchRequest, rootID: String, limit: Int,

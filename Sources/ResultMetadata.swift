@@ -6,6 +6,20 @@ struct ResultMetadata {
     var modified: Date?
 }
 
+enum MetadataPathScope {
+    static func contains(_ path: String, changedPaths: Set<String>) -> Bool {
+        var current = path
+        while !current.isEmpty {
+            if changedPaths.contains(current) { return true }
+            if current == "/" { break }
+            let parent = (current as NSString).deletingLastPathComponent
+            if parent == current { break }
+            current = parent
+        }
+        return false
+    }
+}
+
 struct ResultMetadataReadTestHooks {
     var beforeRead: ((String) -> Void)?
 }
@@ -85,6 +99,37 @@ final class ResultMetadataCache {
         oldest = nil; newest = nil; values.removeAll()
         pending.removeAll(); waiting.removeAll(); waitingHead = 0
         cacheCapacity = Self.defaultCapacity
+    }
+    /// Attribute-only events do not invalidate unrelated visible rows. A
+    /// cancelled in-flight batch is retried under a fresh token, preventing an
+    /// older filesystem read from filling the changed path's cache again.
+    func invalidate(paths: [String]) {
+        guard !paths.isEmpty else { return }
+        for path in paths {
+            guard let entry = values.removeValue(forKey: path) else { continue }
+            if let previous = entry.previous { previous.next = entry.next }
+            else { oldest = entry.next }
+            if let next = entry.next { next.previous = entry.previous }
+            else { newest = entry.previous }
+            entry.previous = nil; entry.next = nil
+        }
+        guard paths.contains(where: { pending.contains($0) }) else { return }
+        readToken.cancel(); readToken = ResultMetadataReadToken()
+        waiting = pending.map { Optional($0) }; waitingHead = 0
+        readNextBatch()
+    }
+    /// Cached rows survive switching queries and scrolling offscreen. Match
+    /// the complete bounded cache and pending set, not only today's visible
+    /// rows, so returning to an earlier query cannot reveal stale attributes.
+    @discardableResult
+    func invalidateChangedPaths(_ paths: [String]) -> [String] {
+        guard !paths.isEmpty else { return [] }
+        let changed = Set(paths)
+        let affected = Array(Set(values.keys).union(pending).filter {
+            MetadataPathScope.contains($0, changedPaths: changed)
+        })
+        invalidate(paths: affected)
+        return affected
     }
     func load(paths: [String]) {
         // A normal visible-row request stays small. Explicit sorting of loaded

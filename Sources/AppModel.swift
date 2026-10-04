@@ -37,7 +37,6 @@ final class AppModel: NSObject {
     // Concurrent scheduling allows a newer name-only query to run immediately.
     private let searchQueue = DispatchQueue(label: "cn.local.quickfind.search", qos: .userInitiated, attributes: .concurrent)
     private let metadataQuery = MetadataQuery()
-    private var metadataIndexVersion = ""
     private(set) var searchGeneration = 0
     private var searchWork: DispatchWorkItem?
     private var searchCancellation = CancellationFlag()
@@ -48,7 +47,10 @@ final class AppModel: NSObject {
     private var stopped = false
     private var lastSearchScheduled = Date.distantPast
     private(set) var latestSearchRevision: UInt64 = 0
+    private(set) var latestMetadataRevision: UInt64 = 0
+    private(set) var changedMetadataPaths: [String]?
     private var searchedRevision: UInt64?
+    private var searchedMetadataRevision: UInt64?
     private var resultLimit = 2000
     private var previousQueryKey = ""
 
@@ -66,9 +68,9 @@ final class AppModel: NSObject {
         store.onUpdate = { [weak self] state in
             DispatchQueue.main.async { [weak self] in
                 guard let self, !self.stopped else { return }
-                let metadataVersion = String(state.searchRevision)
-                if metadataVersion != self.metadataIndexVersion {
-                    self.metadataIndexVersion = metadataVersion
+                let indexChanged = self.latestSearchRevision != state.searchRevision
+                let metadataChanged = self.latestMetadataRevision != state.metadataRevision
+                if indexChanged || metadataChanged {
                     self.metadataQuery.invalidate()
                 }
                 self.roots = state.roots
@@ -77,8 +79,15 @@ final class AppModel: NSObject {
                 self.issues = state.issues
                 self.message = state.message
                 self.latestSearchRevision = state.searchRevision
+                if metadataChanged {
+                    let isNextRevision = state.metadataRevision == (self.latestMetadataRevision &+ 1)
+                    self.latestMetadataRevision = state.metadataRevision
+                    // The paths describe one batch. If a publisher coalesces
+                    // snapshots, changes from skipped batches must not be lost.
+                    self.changedMetadataPaths = isNextRevision ? state.changedMetadataPaths : nil
+                }
                 self.onChange?()
-                if self.searchedRevision != state.searchRevision,
+                if self.needsIndexRefresh,
                    !state.isScanning || Date().timeIntervalSince(self.lastSearchScheduled) > 1.5 {
                     self.searchForIndexUpdate()
                 }
@@ -87,10 +96,15 @@ final class AppModel: NSObject {
         store.start()
     }
 
+    private var needsIndexRefresh: Bool {
+        searchedRevision != latestSearchRevision
+            || (hasMetadataConditions && searchedMetadataRevision != latestMetadataRevision)
+    }
+
     private func searchForIndexUpdate() {
         // Keep an in-flight user search alive. A final index update still needs
         // one fresh query after that search completes, even without more events.
-        guard searchedRevision != latestSearchRevision else { return }
+        guard needsIndexRefresh else { return }
         if pendingQueryKey == searchSignature {
             refreshAfterPending = true
             return
@@ -111,6 +125,7 @@ final class AppModel: NSObject {
         let generation = searchGeneration
         lastSearchScheduled = Date()
         searchedRevision = latestSearchRevision
+        searchedMetadataRevision = latestMetadataRevision
         searchWork?.cancel()
         searchCancellation.cancel()
         let cancellation = CancellationFlag()
@@ -195,7 +210,7 @@ final class AppModel: NSObject {
                 let needsRefresh = self.refreshAfterPending
                 self.refreshAfterPending = false
                 self.onChange?()
-                if needsRefresh && self.searchSignature == key && self.searchedRevision != self.latestSearchRevision {
+                if needsRefresh && self.searchSignature == key && self.needsIndexRefresh {
                     self.search(immediate: true, background: true)
                 }
             }

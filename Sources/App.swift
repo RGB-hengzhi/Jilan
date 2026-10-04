@@ -91,7 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func about(_ sender: Any?) {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "疾览 · Jilan",
-            .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.2.2",
+            .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.2.3",
             .version: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1",
             .credits: NSAttributedString(string: "by 塔贰舅\n\n全盘即时搜索与双栏文件管理\n\n搜索索引保存在这台 Mac 上。\n移植并改造 Cling 的 SIMD 与独立索引核心。\n开源声明和许可证见「开源声明」。"),
             NSApplication.AboutPanelOptionKey(rawValue: "Copyright"): "© 2026 塔贰舅 · GPL-3.0 开源许可"
@@ -258,11 +258,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
     private let issuesButton = NSButton(title: "查看扫描问题", target: nil, action: nil)
     private let previewPath = NSTextField(labelWithString: "选择结果后：回车打开 · ⌘回车定位 · 空格预览 · ⌘⇧C 复制路径")
     private var displayedResults: [FileHit] = []
+    private var displayedSourceResults: [FileHit] = []
     private var displayedQuerySignature: String?
     private var displayedRoots: [RootStatus] = []
     private var displayedSortKey = ""
     private var displayedResultsAreCurrent = false
     private var displayedSearchRevision: UInt64?
+    private var displayedMetadataRevision: UInt64?
     private var issuesController: NSWindowController?
     private var hotKeyUnavailable = false
     private var updating = false
@@ -645,7 +647,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         let selectedPaths = displayedQuerySignature == model.searchSignature ? Set(resultsTable.selectedRowIndexes.compactMap { displayedResults.indices.contains($0) ? displayedResults[$0].path : nil }) : []
         let indexChanged = displayedSearchRevision != model.latestSearchRevision
         displayedSearchRevision = model.latestSearchRevision
-        if indexChanged { resultMetadata.invalidate() }
+        let metadataChanged = displayedMetadataRevision != model.latestMetadataRevision
+        displayedMetadataRevision = model.latestMetadataRevision
+        var changedDisplayPaths: [String] = []
+        let invalidateAllMetadata = indexChanged || (metadataChanged && model.changedMetadataPaths == nil)
+        if invalidateAllMetadata { resultMetadata.invalidate() }
+        else if metadataChanged, let paths = model.changedMetadataPaths {
+            let changed = Set(paths)
+            changedDisplayPaths = displayedResults.filter(\.isOnline).map(\.path)
+                .filter { MetadataPathScope.contains($0, changedPaths: changed) }
+            resultMetadata.invalidateChangedPaths(paths)
+        }
         if displayedRoots != model.roots {
             displayedRoots = model.roots
             rootsTable.reloadData()
@@ -660,9 +672,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         matchPathButton.state = model.matchPath ? .on : .off
         rebuildFilterChips()
         let sortKey = resultSortColumn + String(resultSortAscending)
-        let nextResults = sortedResults(model.results)
-        let resultsChanged = displayedQuerySignature != model.searchSignature
-            || displayedResults != nextResults || displayedSortKey != sortKey
+        let sourceChanged = displayedQuerySignature != model.searchSignature || displayedSourceResults != model.results
+        let sortChanged = displayedSortKey != sortKey
+        let sortsMetadata = resultSortColumn == "size" || resultSortColumn == "modified"
+        let metadataAffectsSort = sortsMetadata && (invalidateAllMetadata || !changedDisplayPaths.isEmpty)
+        // Pure progress/status notifications do not rebuild an unchanged sort.
+        let shouldSort = sourceChanged || sortChanged || metadataAffectsSort
+        let nextResults = shouldSort ? sortedResults(model.results) : displayedResults
+        let resultsChanged = sourceChanged || sortChanged || (shouldSort && displayedResults != nextResults)
+        displayedSourceResults = model.results
         let availabilityChanged = displayedResultsAreCurrent != model.resultsAreCurrent
         displayedQuerySignature = model.searchSignature
         displayedResultsAreCurrent = model.resultsAreCurrent
@@ -674,10 +692,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
             resultsTable.selectRowIndexes(selectedIndexes, byExtendingSelection: false)
             loadVisibleMetadata()
         }
-        if indexChanged {
-            if resultSortColumn == "size" || resultSortColumn == "modified" { resultMetadata.load(paths: displayedResults.filter(\.isOnline).map(\.path)) }
+        if invalidateAllMetadata {
+            if sortsMetadata { resultMetadata.load(paths: displayedResults.filter(\.isOnline).map(\.path)) }
             else { loadVisibleMetadata() }
-            workspace?.refreshSelectedPreview()
+        } else if !changedDisplayPaths.isEmpty {
+            let changed = Set(changedDisplayPaths)
+            let requested = sortsMetadata ? changedDisplayPaths : visibleMetadataPaths().filter { changed.contains($0) }
+            resultMetadata.load(paths: requested)
+        }
+        if indexChanged || metadataChanged {
+            workspace?.refreshSelectedPreview(changedPaths: indexChanged ? nil : model.changedMetadataPaths)
         }
         let count = NumberFormatter.localizedString(from: NSNumber(value: model.totalMatches), number: .decimal)
         let shown = model.results.count
@@ -1046,12 +1070,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         return ResultMetadata(size: hit.size ?? cached?.size, modified: hit.modifiedDate ?? cached?.modified)
     }
     @objc private func resultScrollChanged(_ notification: Notification) { loadVisibleMetadata() }
-    private func loadVisibleMetadata() {
+    private func visibleMetadataPaths() -> [String] {
         let range = resultsTable.rows(in: resultsTable.visibleRect)
-        guard range.location != NSNotFound else { return }
+        guard range.location != NSNotFound else { return [] }
         let indices = range.location..<min(displayedResults.count, range.location + range.length + 8)
-        let hits = indices.compactMap { displayedResults.indices.contains($0) ? displayedResults[$0] : nil }.filter(\.isOnline)
-        resultMetadata.load(paths: hits.map(\.path))
+        return indices.compactMap { displayedResults.indices.contains($0) ? displayedResults[$0] : nil }
+            .filter(\.isOnline).map(\.path)
+    }
+    private func loadVisibleMetadata() {
+        resultMetadata.load(paths: visibleMetadataPaths())
     }
     private func refreshResultMetadata() {
         guard !updating, !displayedResults.isEmpty else { return }
