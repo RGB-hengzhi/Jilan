@@ -91,7 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func about(_ sender: Any?) {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "疾览 · Jilan",
-            .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.2.3",
+            .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.2.4",
             .version: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1",
             .credits: NSAttributedString(string: "by 塔贰舅\n\n全盘即时搜索与双栏文件管理\n\n搜索索引保存在这台 Mac 上。\n移植并改造 Cling 的 SIMD 与独立索引核心。\n开源声明和许可证见「开源声明」。"),
             NSApplication.AboutPanelOptionKey(rawValue: "Copyright"): "© 2026 塔贰舅 · GPL-3.0 开源许可"
@@ -258,6 +258,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
     private let issuesButton = NSButton(title: "查看扫描问题", target: nil, action: nil)
     private let previewPath = NSTextField(labelWithString: "选择结果后：回车打开 · ⌘回车定位 · 空格预览 · ⌘⇧C 复制路径")
     private var displayedResults: [FileHit] = []
+    private var preparedResultDragItems: [Int: NSURL] = [:]
+    private var resultDragStatus: String?
     private var displayedSourceResults: [FileHit] = []
     private var displayedQuerySignature: String?
     private var displayedRoots: [RootStatus] = []
@@ -565,6 +567,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         resultsTable.rowHeight = 28
         resultsTable.usesAlternatingRowBackgroundColors = true
         resultsTable.allowsMultipleSelection = true
+        resultsTable.setDraggingSourceOperationMask(.copy, forLocal: false)
+        resultsTable.setDraggingSourceOperationMask(.copy, forLocal: true)
+        resultsTable.onPrepareDrag = { [weak self] rows in self?.prepareResultDrag(rows: rows) ?? false }
+        resultsTable.onResetDrag = { [weak self] in self?.preparedResultDragItems.removeAll() }
         resultsTable.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         resultsTable.target = self
         resultsTable.doubleAction = #selector(openSelection(_:))
@@ -641,6 +647,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
     }
 
     private func update() {
+        if displayedQuerySignature != model.searchSignature { resultDragStatus = nil }
         guard !updating else { return }
         updating = true
         defer { updating = false }
@@ -737,7 +744,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         if model.isScanning { scanIndicator.startAnimation(nil) } else { scanIndicator.stopAnimation(nil) }
         cancelButton.isHidden = !model.isScanning
         let scanned = NumberFormatter.localizedString(from: NSNumber(value: model.scannedCount), number: .decimal)
-        footerLabel.stringValue = model.isScanning ? "\(model.message) · 已发现 \(scanned) 项" : model.message
+        footerLabel.stringValue = resultDragStatus ?? (model.isScanning ? "\(model.message) · 已发现 \(scanned) 项" : model.message)
         if hotKeyUnavailable { footerLabel.stringValue += " · 呼出快捷键被占用，可使用菜单栏打开" }
         footerLabel.toolTip = footerLabel.stringValue
         issuesButton.isHidden = model.issues.isEmpty
@@ -746,6 +753,53 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { tableView === rootsTable ? model.roots.count + 1 : displayedResults.count }
+
+    private func prepareResultDrag(rows: IndexSet) -> Bool {
+        FileDragSource.recordQAEvent("prepare rows=\(Array(rows))")
+        preparedResultDragItems.removeAll()
+        do {
+            preparedResultDragItems = try FileDragSource.prepare(results: displayedResults, rows: rows,
+                                                                 resultsAreCurrent: model.resultsAreCurrent)
+            return true
+        } catch {
+            showResultDragStatus("本次拖出已取消：\(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func showResultDragStatus(_ text: String) {
+        resultDragStatus = text
+        footerLabel.stringValue = text
+        footerLabel.toolTip = text
+    }
+
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        FileDragSource.recordQAEvent("writer row=\(row) prepared=\(preparedResultDragItems.count)")
+        guard tableView === resultsTable else { return nil }
+        // Use the gesture's captured URL, even if a background refresh or
+        // metadata sort has since changed the displayed row order.
+        if let captured = preparedResultDragItems[row] { return captured }
+        // AppKit can request a representation while deciding whether a drag is
+        // possible. Do not depend on preflight having already run; canDragRows
+        // still validates the entire selection before allowing the session.
+        guard model.resultsAreCurrent, displayedResults.indices.contains(row) else { return nil }
+        return NSURL(fileURLWithPath: displayedResults[row].path)
+    }
+
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
+                   willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
+        guard tableView === resultsTable else { return }
+        FileDragSource.recordQAEvent("began rows=\(Array(rowIndexes)) point=\(screenPoint) frame=\(window?.frame ?? .zero)")
+        showResultDragStatus("正在拖出 \(rowIndexes.count) 个项目")
+    }
+
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
+                   endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        FileDragSource.recordQAEvent("ended operation=\(operation.rawValue) point=\(screenPoint)")
+        guard tableView === resultsTable else { return }
+        preparedResultDragItems.removeAll()
+        showResultDragStatus(operation.isEmpty ? "已取消拖出，原文件保留" : "拖放已结束，原文件保留")
+    }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         if tableView === rootsTable {
@@ -789,6 +843,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
             showSearch(); model.search()
         } else {
             guard !updating else { return }
+            if resultDragStatus != nil {
+                resultDragStatus = nil
+                footerLabel.stringValue = model.message
+                footerLabel.toolTip = footerLabel.stringValue
+            }
             updateSelectionDescription()
         }
     }
@@ -1175,6 +1234,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
 
 @MainActor
 private final class ResultTableView: NSTableView {
+    var onPrepareDrag: ((IndexSet) -> Bool)?
+    var onResetDrag: (() -> Void)?
     var onOpen: (() -> Void)?
     var onReveal: (() -> Void)?
     var onPreview: (() -> Void)?
@@ -1189,7 +1250,13 @@ private final class ResultTableView: NSTableView {
     @objc func cut(_ sender: Any?) { onFocus?(); onCutFiles?() }
     @objc func paste(_ sender: Any?) { onFocus?(); onPasteFiles?() }
     override func becomeFirstResponder() -> Bool { let accepted = super.becomeFirstResponder(); if accepted { onFocus?() }; return accepted }
-    override func mouseDown(with event: NSEvent) { onFocus?(); super.mouseDown(with: event) }
+    override func mouseDown(with event: NSEvent) { onResetDrag?(); onFocus?(); super.mouseDown(with: event) }
+    override func canDragRows(with rowIndexes: IndexSet, at mouseDownPoint: NSPoint) -> Bool {
+        FileDragSource.recordQAEvent("canDragRows rows=\(Array(rowIndexes))")
+        guard super.canDragRows(with: rowIndexes, at: mouseDownPoint) else { return false }
+        onFocus?()
+        return onPrepareDrag?(rowIndexes) ?? false
+    }
     override func keyDown(with event: NSEvent) {
         onFocus?()
         if event.keyCode == 51, event.modifierFlags.contains(.command) { onDeleteFiles?(); return }

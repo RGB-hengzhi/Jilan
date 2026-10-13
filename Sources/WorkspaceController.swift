@@ -1109,7 +1109,11 @@ private final class WorkspacePaneController: NSViewController, NSTableViewDataSo
         }
     }
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? { entries.indices.contains(row) ? NSURL(fileURLWithPath: entries[row].path) : nil }
-    func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation { guard isUsableDirectoryDestination, info.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) else { return [] }; tableView.setDropRow(-1, dropOperation: .on); return .copy }
+    func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
+        FileDragSource.recordQAEvent("destination usable=\(isUsableDirectoryDestination) types=\(info.draggingPasteboard.types ?? [])")
+        guard isUsableDirectoryDestination, info.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) else { return [] }
+        tableView.setDropRow(-1, dropOperation: .on); return .copy
+    }
     func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
         guard isUsableDirectoryDestination, let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty else { return false }
         onFocus?(); onDrop?(urls.map(\.path), currentPath); return true
